@@ -652,7 +652,12 @@ def main():
     organizer.organize()
 
 if __name__ == "__main__":
-    # For direct execution without command line args
-    music_path = r"C:\Users\andys\Documents\Claude\Music"
-    organizer = AdvancedMusicOrganizer(music_path)
-    organizer.organize()
+    # Check for command line arguments
+    import sys
+    if len(sys.argv) > 1:
+        main()
+    else:
+        # For direct execution without command line args
+        music_path = r"C:\Users\andys\Documents\Claude\Music"
+        organizer = AdvancedMusicOrganizer(music_path)
+        organizer.organize()
