@@ -1,6 +1,6 @@
 # Music Organizer Project
 
-**Version 2.1.0**
+**Version 3.0.0**
 
 A Python music library organizer that sorts audio files into a clean
 `Artist/Album/NN - Title.ext` structure using embedded metadata, directory

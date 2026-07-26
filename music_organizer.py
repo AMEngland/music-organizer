@@ -35,7 +35,7 @@ try:
 except ImportError:  # pragma: no cover - module ships with the tool
     fingerprint = None
 
-__version__ = "2.1.0"
+__version__ = "3.0.0"
 
 # Try to import optional dependencies
 try:

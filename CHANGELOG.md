@@ -3,6 +3,36 @@
 All notable changes to this project. Versions follow
 [Semantic Versioning](https://semver.org/).
 
+## [3.0.0] — 2026-07-26
+
+The first release with the whole [AUDIT.md](AUDIT.md) roadmap delivered and
+documented. No behavioural changes from 2.1.0 — this release is the
+documentation and the version stamp that make the work usable by someone who was
+not there when it was written.
+
+### Added
+
+- **[HOWTO.md](HOWTO.md)** — the user guide. Installing, running the tool on a
+  folder of MP3s, what it does to your files (and what it never does), how a
+  track gets identified, which tags are read and written, how duplicates are
+  detected, the naming rules, clearing the manual pile, fingerprinting setup,
+  incremental runs, undo, every command-line option, every configuration
+  setting, worked recipes, and a troubleshooting section.
+- README links the guide; `CLAUDE.md` records that a new config key must be
+  documented in four places, since a key documented in only some of them is
+  worse than one documented nowhere.
+
+### Verified
+
+- Both defects found during Tier 3 development remain fixed and covered:
+  an acoustic match overwriting embedded tags, and the interactive resolver
+  splitting unparseable filenames into one group per file.
+- All 36 configuration keys and all 20 command-line flags are checked to be
+  present in the guide.
+- 200 tests passing, requiring no real audio, no `fpcalc` and no network.
+
+---
+
 ## [2.1.0] — 2026-07-26
 
 Tier 3 of the [AUDIT.md](AUDIT.md) roadmap (items 16-21): identification for
