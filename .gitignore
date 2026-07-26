@@ -1,0 +1,19 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# Tool output
+Music_Organized/
+Reports/
+Playlists/
+*.m3u
+*.csv
+.music_organizer.db
+.music_organizer.db-*
+run_*.log
+
+# Local overrides
+.env

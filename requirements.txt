@@ -1,0 +1,3 @@
+# Optional but strongly recommended: without mutagen the organizer falls back
+# to path and filename parsing only.
+mutagen>=1.45

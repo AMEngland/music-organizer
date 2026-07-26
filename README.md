@@ -1,35 +1,120 @@
 # Music Organizer Project
 
-A comprehensive Python-based music library organization tool that sorts audio files using metadata, directory structure, and filename parsing.
+**Version 2.0.0**
+
+A Python music library organizer that sorts audio files into a clean
+`Artist/Album/NN - Title.ext` structure using embedded metadata, directory
+structure, and filename parsing — deduplicating by audio content along the way.
+
+Every run is planned before it executes, recorded in a database, and reversible.
+
+See [AUDIT.md](AUDIT.md) for the codebase audit and improvement roadmap, and
+[CHANGELOG.md](CHANGELOG.md) for what has changed.
 
 ## Features
 
-- **Smart Organization**: Sorts music into Artist/Album/Track structure
-- **Metadata Reading**: Uses embedded ID3 tags when available (via mutagen)
-- **Duplicate Detection**: MD5 hashing prevents duplicate files
-- **Album Art Extraction**: Saves embedded artwork as folder.jpg
-- **Playlist Generation**: Creates M3U playlists by genre, year, artist
-- **Quality Analysis**: Reports bitrate and format statistics
-- **Near-Duplicate Detection**: Finds different versions of same songs
-- **Interactive Preview**: Shows organization plan before execution
-- **Manual Sort Support**: Handles unparseable files for manual review
-- **Incremental Updates**: Add new music to existing organized collection
+- **Smart Organization**: Sorts music into `Artist/Album/NN - Title.ext`
+- **Metadata Reading**: Embedded tags via mutagen, including `albumartist`,
+  track/disc numbers, and numeric genre references
+- **Filename Normalization**: Configurable output template, zero-padded track
+  numbers, junk stripping, Windows-safe path components
+- **Content-Based Deduplication**: Hashes the audio payload only, so copies that
+  differ merely in their tags are still detected
+- **Quality-Ranked Survivors**: When duplicates are found, the best copy is kept
+  (lossless > bitrate > tag completeness > size)
+- **Artist Canonicalization**: `The Beatles` / `beatles` / `BEATLES` /
+  `Beatles, The` collapse into one folder, with a casing pass that leaves
+  `MGMT`, `ABBA` and `deadmau5` alone
+- **Confidence Scoring**: Every classification is scored, and the shaky ones are
+  queued in an editable CSV instead of disappearing into a folder
+- **Dry Run**: `--dry-run` writes the full plan as CSV and touches nothing
+- **Undo**: any run can be reversed
+- **Incremental**: repeat runs skip what the collection already holds
+- **Album Art Extraction**: Saves embedded artwork as `folder.jpg`
+- **Playlist Generation**: M3U playlists by genre, year, or artist
+- **Reports**: quality, duplicates, near-duplicates, unclassified files, artist
+  merges, plus a per-run log
 
 ## Quick Start
 
 ```bash
 # Install dependencies
-pip install mutagen pillow
+pip install -r requirements.txt
 
-# Organize your music collection
+# See what would happen, without writing anything
+python music_organizer.py "C:\path\to\your\Music" --dry-run
+
+# Organize for real
 python music_organizer.py "C:\path\to\your\Music"
 
-# Interactive mode (preview before organizing)
-python music_organizer.py "C:\path\to\your\Music" --interactive
-
-# Organize manual sort folder into existing collection
-python music_organizer.py "C:\path\to\Music_Organized" --manual-only "C:\path\to\Music_Organized\Manual Sort Needed"
+# Changed your mind
+python music_organizer.py "C:\path\to\Music_Organized" --undo
 ```
+
+Originals are never modified — the organizer copies. The modes that **move**
+files are `--manual-only` and `--apply-csv`, and both are undoable.
+
+## Command Reference
+
+| Flag | Purpose |
+| --- | --- |
+| `--dry-run` | Plan only. Writes `Reports/plan.csv` and nothing else. |
+| `--output DIR` | Destination collection (default `<music_path>/../Music_Organized`). |
+| `--interactive` | Show a sample of the plan and confirm before writing. |
+| `--no-rename` | Keep original filenames; only reorganize folders. |
+| `--incremental` | Add new music to an existing collection (requires `--output`). |
+| `--reindex` | Rebuild the library index by hashing the collection on disk. |
+| `--manual-only DIR` | Re-ingest a manual sort folder into the collection. |
+| `--apply-csv FILE` | Re-file tracks from a corrected `review_queue.csv`. |
+| `--undo [RUN_ID]` | Reverse a run (default: the most recent). Needs `--yes` to skip the prompt. |
+| `--list-runs` | Show the run history for a collection. |
+| `--verbose` / `--quiet` | Console detail level. The log file is always full detail. |
+| `--config FILE` | Configuration file path. |
+| `--version` | Print the version and exit. |
+
+For `--undo`, `--list-runs` and `--apply-csv`, the positional argument is the
+**collection**, not the source folder.
+
+## Typical Workflows
+
+**First pass over a messy library**
+
+```bash
+python music_organizer.py "D:\Music" --dry-run
+# read Music_Organized\Reports\plan.csv, adjust config if needed
+python music_organizer.py "D:\Music"
+```
+
+**Fix the files it could not identify**
+
+```bash
+# Edit Music_Organized\Reports\review_queue.csv in a spreadsheet:
+# fill in artist / album / title / track for the rows you care about.
+python music_organizer.py "D:\Music_Organized" --apply-csv "D:\Music_Organized\Reports\review_queue.csv"
+```
+
+Rows left blank are skipped, and rows already filed correctly are no-ops, so the
+file can be applied repeatedly as you work through it.
+
+**Add new downloads later**
+
+```bash
+python music_organizer.py "D:\NewAlbums" --incremental --output "D:\Music_Organized"
+```
+
+Anything already in the collection is skipped by audio hash — including copies
+that were renamed or retagged since.
+
+**Back out a run**
+
+```bash
+python music_organizer.py "D:\Music_Organized" --list-runs
+python music_organizer.py "D:\Music_Organized" --undo 7
+```
+
+Copies are deleted, moves are restored, and empty folders are pruned. A file is
+only touched if its audio still matches what was recorded, so anything you
+edited afterwards is left alone.
 
 ## Output Structure
 
@@ -37,81 +122,177 @@ python music_organizer.py "C:\path\to\Music_Organized" --manual-only "C:\path\to
 Music_Organized/
 ├── Artist Name/
 │   ├── Album Name/
-│   │   ├── track1.mp3
-│   │   ├── track2.mp3
+│   │   ├── 01 - First Track.mp3
+│   │   ├── 02 - Second Track.mp3
 │   │   └── folder.jpg (album art)
 │   └── Singles/
-├── Manual Sort Needed/ (files needing manual review)
+├── Manual Sort Needed/      (files that could not be identified)
 ├── Playlists/
 │   ├── genre_Rock.m3u
 │   └── year_2023.m3u
-└── Reports/
-    ├── quality_report.txt
-    ├── near_duplicates.txt
-    └── organization_summary.txt
+├── Reports/
+│   ├── plan.csv              (every decision, with confidence)
+│   ├── review_queue.csv      (editable; feed back with --apply-csv)
+│   ├── quality_report.txt
+│   ├── duplicates.txt        (what was skipped, and why)
+│   ├── near_duplicates.txt   (same song, different encode)
+│   ├── unclassified.txt
+│   ├── artist_merges.txt     (name variants folded together)
+│   ├── organization_summary.txt
+│   └── run_20260726_010319.log
+└── .music_organizer.db       (scan cache, library index, undo log)
 ```
 
-## Configuration
+## How Classification Works
 
-The tool creates `music_organizer_config.ini` with customizable settings:
+Sources are consulted in descending reliability and merged field by field, so a
+partially-identifiable file is still filed correctly rather than being dumped
+into manual sort:
 
-- Enable/disable features (playlists, album art, quality analysis)
-- Set minimum bitrate thresholds
-- Configure playlist creation rules
-- Specify folders to skip
+1. **Embedded tags** — `albumartist` preferred over `artist`, so compilations
+   stay together.
+2. **Directory structure** — inferred relative to the scan root. The two
+   directories nearest the file are used, so both `Artist/Album/` and
+   `Genre/Artist/Album/` trees work. Generic containers (`Downloads`, `mp3s`,
+   `Amazon MP3`, …) are ignored, and `CD1` / `Disc 2` folders become disc
+   numbers.
+3. **Filename** — see the patterns below.
 
-## Files
+A file with a usable artist but no album goes to `Artist/Singles`. Only a file
+with no identifiable artist at all goes to `Manual Sort Needed`.
 
-- `music_organizer.py` - Main organizer with all features
-- `add_new_music.py` - Add new files to existing organized collection
-- `music_organizer_config.ini` - Generated configuration file
+### Confidence
 
-## Development Notes
+Each result is scored 0-100 from the reliability of its artist source, its title
+source, and how much corroborating metadata exists. Roughly:
 
-- Originally started as simple folder organization
-- Evolved to include metadata reading, duplicate detection, and reporting
-- Uses MD5 hashing for reliable duplicate detection
-- Preserves original files (copies, doesn't move)
-- Conservative filename parsing to avoid false artist assignments
+| Situation | Score | Outcome |
+| --- | --- | --- |
+| Full tags, album and track number | 90+ | filed |
+| Artist from folder structure, album known | ~65 | filed |
+| Artist guessed from a `Artist - Title` filename | ~40 | filed, queued for review |
+| Artist guessed from a single unspaced dash | ~30 | filed, queued for review |
+| No artist anywhere | 0 | `Manual Sort Needed` |
+
+Anything below `CLASSIFY.review_threshold` (default 55) is written to
+`review_queue.csv`. By default it still goes into the main library — set
+`route_review = true` to divert it into a `Review/` folder instead.
+
+## How Deduplication Works
+
+Duplicates are found by hashing the **audio payload**, not the whole file. ID3v2
+headers, ID3v1 / APEv2 / Lyrics3 trailers, FLAC metadata blocks and MP4 atoms
+outside `mdat` are excluded, so two copies of the same recording match even when
+their tags, embedded artwork, or padding differ. Containers that cannot be
+parsed fall back to a whole-file hash.
+
+When a group of duplicates is found, the survivor is chosen by:
+lossless format → higher bitrate → more complete tags → larger file. Every
+skipped copy is listed in `Reports/duplicates.txt` with the reason.
+
+Different *encodes* of the same recording (a 128kbps and a 320kbps rip) have
+different audio and are reported in `near_duplicates.txt` rather than merged —
+merging those requires acoustic fingerprinting, which is on the roadmap.
 
 ## Manual File Naming Convention
 
-For files in the "Manual Sort Needed" folder, use this naming format:
+Files in `Manual Sort Needed` can be renamed and re-ingested with
+`--manual-only`. All of these are understood:
 
-**`Artist - Track.mp3`**
+| Filename | Result |
+| --- | --- |
+| `Pink Floyd - Comfortably Numb.mp3` | `Pink Floyd/Singles/Comfortably Numb.mp3` |
+| `Nirvana - Nevermind - Lithium.mp3` | `Nirvana/Nevermind/Lithium.mp3` |
+| `05 - Nirvana - Lithium.mp3` | `Nirvana/Singles/05 - Lithium.mp3` |
+| `Beatles_HeyJude.mp3` | `Beatles/Singles/HeyJude.mp3` |
+| `Nirvana-Lithium.mp3` | `Nirvana/Singles/Lithium.mp3` |
+| `Björk – Hyperballad.mp3` | `Björk/Singles/Hyperballad.mp3` |
+| `Radiohead, Creep.mp3` | `Radiohead/Singles/Creep.mp3` |
 
-Examples:
-- `Pink Floyd - Comfortably Numb.mp3` → Pink Floyd/Singles/
-- `Beatles - Hey Jude.mp3` → Beatles/Singles/
-- `Radiohead - Creep.mp3` → Radiohead/Singles/
+Scene junk is removed automatically, so
+`03_-_Muse_-_Hysteria_(Official Video)_[320kbps]_www.example.com.mp3` becomes
+`Muse/Singles/03 - Hysteria.mp3`. Genuine qualifiers such as `(Live)`,
+`(Acoustic)` and `(Remix)` are kept as part of the title.
 
-**Alternative formats:**
-- `Artist - Album - Track.mp3` → Artist/Album/
-- `Artist_Track.mp3` (underscore separator) → Artist/Singles/
-- Remove track numbers: `01 - Song.mp3` → `Song.mp3`
-- Files with embedded metadata are parsed automatically
+**Still not parseable:**
 
-**Avoid:**
-- Single words as artists ("The", "A", "I") - these are filtered out
-- Numbers only as artist names
-- Common words ("and", "or", "but") as artist names
+- Single words or stopwords as artists (`The`, `A`, `I`, `and`)
+- Numbers only (`09182734.mp3`)
+- Anything with no artist and no usable tags
 
-## Usage Examples
+For those, use `review_queue.csv` and `--apply-csv` instead of renaming by hand.
 
-**Basic organization:**
-```bash
-python music_organizer.py "C:\path\to\your\Music"
+## Configuration
+
+`music_organizer_config.ini` is created on first run and any missing keys are
+backfilled on later runs, so upgrading never requires deleting it.
+
+| Section | Key | Purpose |
+| --- | --- | --- |
+| `GENERAL` | `interactive_mode`, `create_playlists`, `extract_album_art`, `analyze_quality`, `find_near_duplicates` | Feature toggles |
+| `FOLDERS` | `skip_folders` | Comma-separated folder names to skip (matched per path component) |
+| `FOLDERS` | `manual_sort_folder` | Name of the quarantine folder |
+| `NAMING` | `rename_files` | Set `false` to keep original filenames |
+| `NAMING` | `filename_template` | Default `{track} - {title}`; fields: `{track}`, `{title}`, `{artist}`, `{disc}` |
+| `NAMING` | `filename_template_no_track` | Used when no track number is known |
+| `NAMING` | `max_component_length` | Per-component character cap |
+| `NAMING` | `titlecase_names` | Re-case ALL-CAPS and all-lowercase names |
+| `NAMING` | `name_exceptions` | Extra names whose casing must be preserved |
+| `CLASSIFY` | `review_threshold` | Confidence below which a track is queued for review |
+| `CLASSIFY` | `route_review`, `review_folder` | Physically separate low-confidence tracks |
+| `QUALITY` | `min_bitrate` | Threshold for the low-quality report |
+| `PLAYLISTS` | `create_by_genre`, `create_by_year`, `create_by_artist`, `min_songs_for_playlist` | Playlist rules |
+
+### Name casing
+
+`titlecase_names` only rewrites names that are *entirely* upper or lower case —
+deliberate styling such as `Sigur Rós` or `iamamiwhoami` is never touched.
+Vowel-free acronyms (`MGMT`, `TLC`, `XTC`) are detected automatically. Names
+that need protecting but contain vowels (`ABBA`, `KISS`, `R.E.M.`) come from a
+built-in list you can extend:
+
+```ini
+[NAMING]
+name_exceptions = THE KLF, dEUS, ACME
 ```
 
-**Add new music later:**
+## Files
+
+- `music_organizer.py` — main organizer and CLI
+- `naming.py` — filename parsing, artist canonicalization, casing, safe naming
+- `audio_hash.py` — audio-payload-scoped hashing
+- `state.py` — SQLite scan cache, library index and undo log
+- `music_organizer_config.ini` — generated configuration
+- `tests/` — test suite
+- `CLAUDE.md` — architecture notes and invariants for contributors
+
+## Upgrading from 1.x
+
+`add_new_music.py` is gone; use `--incremental --output DIR`. Filenames are
+normalized by default — pass `--no-rename` to keep the 1.x behaviour. Your
+existing `music_organizer_config.ini` is upgraded in place; new keys are
+backfilled, so there is no need to delete it.
+
+The first run against an existing collection hashes what is already there to
+build the library index, so it takes longer than subsequent runs. After that,
+re-running is cheap and idempotent.
+
+## Tests
+
 ```bash
-python add_new_music.py
-# Prompts for new music folder path
+python -m unittest discover -s tests
 ```
 
-**Organize manual files after manual sorting:**
-```bash
-python music_organizer.py "C:\path\to\Music_Organized" --manual-only "C:\path\to\Music_Organized\Manual Sort Needed"
-```
+The suite synthesizes its own audio files, so no real music is needed. Tests
+requiring genuine ID3 tags are skipped if mutagen is not installed.
 
-Perfect for preparing music collections for mobile players like Musicolet that work best with organized Artist/Album structures.
+## Development Notes
+
+- Originally a simple folder organizer; now metadata-driven with content-based
+  deduplication, confidence scoring, and a reversible operation log
+- Preserves original files (copies rather than moves)
+- Conservative filename parsing — an implausible artist guess is discarded
+  rather than creating a junk folder
+
+Suitable for preparing collections for mobile players like Musicolet that work
+best with organized Artist/Album structures.
