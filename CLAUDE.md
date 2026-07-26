@@ -5,13 +5,13 @@ Python CLI that organizes a messy music collection into
 names. Windows-first, but pure `pathlib` and platform-guarded, so it runs
 anywhere.
 
-**Current version: 2.0.0.** v1 was the original single-file tool; v2 is the
+**Current version: 2.1.0.** v1 was the original single-file tool; v2 is the
 post-audit rewrite. See [AUDIT.md](AUDIT.md) for why, [CHANGELOG.md](CHANGELOG.md)
 for what.
 
 ## Architecture
 
-Four modules, deliberately separated so the tricky parts are unit-testable
+Six modules, deliberately separated so the tricky parts are unit-testable
 without real audio files:
 
 | Module | Responsibility |
@@ -19,25 +19,36 @@ without real audio files:
 | `music_organizer.py` | Pipeline, classification, CLI. The only module that touches user files. |
 | `naming.py` | Filename parsing, artist canonicalization, casing, safe path components. Pure functions plus `ArtistRegistry`. No I/O. |
 | `audio_hash.py` | Locating and hashing the audio payload of a container. No I/O beyond reading the file. |
-| `state.py` | SQLite: scan cache, library index, run/undo log. No knowledge of music. |
+| `state.py` | SQLite: scan cache, library index, run/undo log, fingerprint cache. No knowledge of music. |
+| `fingerprint.py` | Chromaprint + AcoustID. The only module that touches the network. |
+| `report_html.py` | Renders the run as one self-contained HTML page. Pure string building. |
 
 Dependency direction is strictly `music_organizer` → {`naming`, `audio_hash`,
-`state`}. The leaf modules never import the pipeline.
+`state`, `fingerprint`, `report_html`}. The leaf modules never import the
+pipeline.
 
 ## The pipeline
 
-`AdvancedMusicOrganizer.organize()` runs four passes. They are separate passes
+`AdvancedMusicOrganizer.organize()` runs a series of passes. They are separate
 on purpose — deduplication needs every file's quality before electing a winner,
 and artist canonicalization needs every name variant before electing a spelling.
 Merging passes would reintroduce the original tool's "first file seen wins" bug.
 
 1. **Scan** — hash + read tags for each file, reusing the SQLite scan cache when
-   `(path, mtime, size)` is unchanged.
+   `(path, mtime, size)` is unchanged. Uncached files may be hashed in a process
+   pool; workers run `scan_payload()` and return plain dicts.
 2. **Deduplicate** — group by audio hash, elect the best copy, then drop
    anything the collection already holds.
 3. **Classify** — merge tags → path → filename field by field; score confidence;
    register artist name variants.
-4. **Plan and execute** — resolve canonical names, build destinations, write.
+3b. **Identify** (optional) — ask AcoustID about whatever the metadata could not
+   place, then re-route affected records.
+4. **Plan and execute** — resolve canonical names, build destinations, write,
+   then tags, sidecars and album art.
+
+Routing is deliberately split out of `classify()` into `assign_route()` and
+`collect_routes()`, because acoustic identification rewrites records after
+classification and their routes have to be recomputed.
 
 ## Invariants — do not break these
 
@@ -55,6 +66,13 @@ Merging passes would reintroduce the original tool's "first file seen wins" bug.
 - **An implausible artist guess is discarded**, not written to disk. A junk
   folder is worse than a file in `Manual Sort Needed`.
 - **Filesystem access goes through `fs_path()`** so Windows long paths work.
+- **Source-ranking is one table, used twice.** `_ARTIST_SOURCE_SCORE` /
+  `_TITLE_SOURCE_SCORE` drive both the confidence score and the decision about
+  whether an AcoustID match may overwrite a field. Keep them consistent: tags
+  outrank acoustid, which outranks path, which outranks filename.
+- **Tag write-back only ever touches the organized copy**, never the source.
+- **Worker functions must stay at module level** and take/return only picklable
+  values, or the process pool breaks on Windows spawn.
 - **Release the SQLite handle** (`close_database()`) at the end of every public
   entry point; Windows will not let the directory be deleted otherwise.
 
@@ -88,8 +106,14 @@ Two traps when writing new tests:
 - **Windows filesystems are case-insensitive.** `beatles/` and `BEATLES/`
   are the same directory, so casing tests must account for it.
 
+## Testing external services
+
+`fingerprint.py` isolates its two external steps in `_run_fpcalc()` and
+`_call_api()` precisely so tests can subclass and replace them. Never inline
+either call — the suite must keep running with no binary and no network.
+Pipeline tests replace the whole service by assigning to
+`organizer.build_fingerprint_service`.
+
 ## Roadmap
 
-Tiers 1 and 2 are complete. Tier 3 (items 16-21 in [AUDIT.md](AUDIT.md)) covers
-acoustic fingerprinting, tag write-back, parallel hashing, sidecar files, an
-interactive resolver, and an HTML report.
+Tiers 1, 2 and 3 in [AUDIT.md](AUDIT.md) are complete.

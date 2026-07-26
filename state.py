@@ -24,7 +24,7 @@ from typing import Dict, Iterable, Iterator, List, Optional, Sequence
 __all__ = ["LibraryDatabase", "DB_FILENAME", "SCHEMA_VERSION"]
 
 DB_FILENAME = ".music_organizer.db"
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS scans (
@@ -64,8 +64,22 @@ CREATE TABLE IF NOT EXISTS operations (
     performed_at TEXT NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS fingerprints (
+    audio_hash   TEXT PRIMARY KEY,
+    duration     INTEGER,
+    fingerprint  TEXT,
+    recording_id TEXT,
+    score        REAL,
+    artist       TEXT,
+    title        TEXT,
+    album        TEXT,
+    year         TEXT,
+    looked_up_at TEXT NOT NULL
+);
+
 CREATE INDEX IF NOT EXISTS operations_run ON operations(run_id);
 CREATE INDEX IF NOT EXISTS library_target ON library(target_path);
+CREATE INDEX IF NOT EXISTS fingerprints_recording ON fingerprints(recording_id);
 """
 
 # Tag fields cached as JSON alongside the hash.
@@ -241,6 +255,45 @@ class LibraryDatabase:
             "(SELECT COUNT(*) FROM operations o WHERE o.run_id = r.run_id) AS operations "
             "FROM runs r ORDER BY r.run_id DESC LIMIT ?", (limit,)
         ))
+
+    # ------------------------------------------------------------------
+    # Acoustic fingerprint cache
+    # ------------------------------------------------------------------
+
+    def cached_fingerprint(self, audio_hash: str) -> Optional[Dict]:
+        """Return a cached AcoustID lookup, including remembered misses.
+
+        Negative results are cached too -- a track the service does not know is
+        not worth asking about again on every run.
+        """
+        row = self._connection.execute(
+            "SELECT * FROM fingerprints WHERE audio_hash = ?", (audio_hash,)
+        ).fetchone()
+        return dict(row) if row else None
+
+    def store_fingerprint(self, audio_hash: str, duration: Optional[int],
+                          fingerprint: Optional[str], match: Optional[Dict]) -> None:
+        match = match or {}
+        with self._transaction() as connection:
+            connection.execute(
+                "INSERT OR REPLACE INTO fingerprints "
+                "(audio_hash, duration, fingerprint, recording_id, score, "
+                " artist, title, album, year, looked_up_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (audio_hash, duration, fingerprint, match.get("recording_id"),
+                 match.get("score"), match.get("artist"), match.get("title"),
+                 match.get("album"), match.get("year"), _now()),
+            )
+
+    def recording_groups(self) -> Dict[str, List[str]]:
+        """Audio hashes grouped by AcoustID recording, for encode-level dupes."""
+        groups: Dict[str, List[str]] = {}
+        for row in self._connection.execute(
+            "SELECT recording_id, audio_hash FROM fingerprints "
+            "WHERE recording_id IS NOT NULL"
+        ):
+            groups.setdefault(row["recording_id"], []).append(row["audio_hash"])
+        return groups
 
     def last_run_id(self) -> Optional[int]:
         row = self._connection.execute(

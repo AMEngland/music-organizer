@@ -19,6 +19,7 @@ import state  # noqa: E402
 from music_organizer import AdvancedMusicOrganizer  # noqa: E402
 
 try:
+    from mutagen import File as MutagenFile
     from mutagen.id3 import APIC, ID3, TALB, TCON, TDRC, TIT2, TPE1, TPE2, TRCK
     MUTAGEN = True
 except ImportError:  # pragma: no cover
@@ -759,6 +760,449 @@ class TestUndo(OrganizerTestCase):
     def test_undo_with_no_runs_reports_cleanly(self):
         organizer = self.build()
         self.assertEqual(organizer.undo_run(assume_yes=True), 0)
+
+
+class FakeMatch:
+    """Stand-in for fingerprint.RecordingMatch."""
+
+    def __init__(self, recording_id="rec-1", score=0.95, artist="Boards of Canada",
+                 title="Roygbiv", album="Music Has the Right to Children", year=None):
+        self.recording_id = recording_id
+        self.score = score
+        self.artist = artist
+        self.title = title
+        self.album = album
+        self.year = year
+
+
+class FakeFingerprintService:
+    """Identifies every file it is handed, or a chosen subset."""
+
+    def __init__(self, matches=None, default=None):
+        self.matches = matches or {}
+        self.default = default
+        self.available = True
+        self.calls = []
+
+    def unavailable_reason(self):
+        return ""
+
+    def identify(self, path, audio_hash=None):
+        self.calls.append(Path(path).name)
+        return self.matches.get(Path(path).name, self.default)
+
+    def summary(self):
+        return f"stub, {len(self.calls)} call(s)"
+
+
+class TestFingerprinting(OrganizerTestCase):
+    def test_unidentified_file_is_named_by_fingerprint(self):
+        self.write("09182734.mp3")
+        organizer = self.build()
+        organizer.build_fingerprint_service = lambda: FakeFingerprintService(
+            default=FakeMatch()
+        )
+        organizer.organize(fingerprint_lookup=True)
+
+        self.assertIn(
+            "Boards of Canada/Music Has the Right to Children/Roygbiv.mp3",
+            self.outputs(organizer),
+        )
+        self.assertEqual(organizer.stats["manual_sort"], 0)
+        self.assertEqual(organizer.stats["identified_by_fingerprint"], 1)
+
+    def test_only_unidentified_files_are_submitted(self):
+        self.write("Nirvana/Nevermind/01 Lithium.mp3", SILENT_MP3 + b"\x01")
+        self.write("09182734.mp3", SILENT_MP3 + b"\x02")
+
+        service = FakeFingerprintService(default=FakeMatch())
+        organizer = self.build()
+        organizer.build_fingerprint_service = lambda: service
+        organizer.organize(fingerprint_lookup=True)
+
+        self.assertEqual(service.calls, ["09182734.mp3"])
+
+    def test_every_file_is_submitted_when_configured(self):
+        self.write("Nirvana/Nevermind/01 Lithium.mp3", SILENT_MP3 + b"\x01")
+        self.write("09182734.mp3", SILENT_MP3 + b"\x02")
+
+        service = FakeFingerprintService(default=None)
+        organizer = self.build()
+        organizer.config.set("FINGERPRINT", "only_unidentified", "false")
+        organizer.build_fingerprint_service = lambda: service
+        organizer.organize(fingerprint_lookup=True)
+
+        self.assertEqual(len(service.calls), 2)
+
+    @unittest.skipUnless(MUTAGEN, "mutagen required")
+    def test_embedded_tags_outrank_an_acoustic_match(self):
+        path = self.write("unsorted/track.mp3")
+        tags = ID3()
+        tags.add(TPE1(encoding=3, text="Nirvana"))
+        tags.add(TALB(encoding=3, text="Nevermind"))
+        tags.add(TIT2(encoding=3, text="Lithium"))
+        tags.add(TRCK(encoding=3, text="1"))
+        tags.save(path)
+
+        organizer = self.build()
+        organizer.config.set("FINGERPRINT", "only_unidentified", "false")
+        organizer.build_fingerprint_service = lambda: FakeFingerprintService(
+            default=FakeMatch(artist="Wrong Artist", title="Wrong Title")
+        )
+        organizer.organize(fingerprint_lookup=True)
+
+        self.assertIn("Nirvana/Nevermind/01 - Lithium.mp3", self.outputs(organizer))
+
+    def test_an_acoustic_match_outranks_a_folder_name_guess(self):
+        self.write("Nirvana/Nevermind/01 Lithium.mp3")
+        organizer = self.build()
+        organizer.config.set("FINGERPRINT", "only_unidentified", "false")
+        organizer.build_fingerprint_service = lambda: FakeFingerprintService(
+            default=FakeMatch(artist="Real Artist", title="Real Title",
+                              album="Real Album")
+        )
+        organizer.organize(fingerprint_lookup=True)
+
+        self.assertIn("Real Artist/Real Album/01 - Real Title.mp3",
+                      self.outputs(organizer))
+
+    def test_confidence_rises_after_identification(self):
+        self.write("09182734.mp3")
+        organizer = self.build()
+        organizer.build_fingerprint_service = lambda: FakeFingerprintService(
+            default=FakeMatch()
+        )
+        organizer.organize(fingerprint_lookup=True)
+
+        record = organizer.planned[0]
+        self.assertEqual(record.artist_source, "acoustid")
+        self.assertGreater(record.confidence, 55)
+
+    def test_unavailable_service_is_a_warning_not_a_failure(self):
+        self.write("09182734.mp3")
+
+        class Unavailable(FakeFingerprintService):
+            available = False
+
+            def unavailable_reason(self):
+                return "fpcalc not found"
+
+        organizer = self.build()
+        organizer.build_fingerprint_service = lambda: Unavailable()
+        organizer.organize(fingerprint_lookup=True)
+
+        self.assertEqual(organizer.stats["manual_sort"], 1)
+        self.assertEqual(organizer.stats["errors"], [])
+
+    def test_fingerprinting_is_off_unless_requested(self):
+        self.write("09182734.mp3")
+        service = FakeFingerprintService(default=FakeMatch())
+        organizer = self.build()
+        organizer.build_fingerprint_service = lambda: service
+        organizer.organize()
+
+        self.assertEqual(service.calls, [])
+
+    def test_encode_duplicates_merge_when_enabled(self):
+        # Different audio, same recording: only fingerprinting can tell.
+        self.write("rip-128/09182734.mp3", SILENT_MP3 + b"\x01")
+        self.write("rip-320/09182735.mp3", SILENT_MP3 + b"\x02" * 200)
+
+        organizer = self.build()
+        organizer.config.set("FINGERPRINT", "merge_duplicate_encodes", "true")
+        organizer.build_fingerprint_service = lambda: FakeFingerprintService(
+            default=FakeMatch()
+        )
+        organizer.organize(fingerprint_lookup=True)
+
+        self.assertEqual(organizer.stats["encode_duplicates_merged"], 1)
+        self.assertEqual(len(self.outputs(organizer)), 1)
+
+    def test_encode_duplicates_are_kept_by_default(self):
+        self.write("rip-128/09182734.mp3", SILENT_MP3 + b"\x01")
+        self.write("rip-320/09182735.mp3", SILENT_MP3 + b"\x02" * 200)
+
+        organizer = self.build()
+        organizer.build_fingerprint_service = lambda: FakeFingerprintService(
+            default=FakeMatch()
+        )
+        organizer.organize(fingerprint_lookup=True)
+
+        self.assertEqual(organizer.stats["encode_duplicates_merged"], 0)
+        self.assertEqual(len(self.outputs(organizer)), 2)
+
+
+class TestTagWriteBack(OrganizerTestCase):
+    @unittest.skipUnless(MUTAGEN, "mutagen required")
+    def test_tags_are_written_to_the_copy(self):
+        self.write("Nirvana/Nevermind/01 Lithium.mp3")
+        organizer = self.build()
+        organizer.config.set("NAMING", "write_tags", "true")
+        organizer.organize()
+
+        target = organizer.organized_path / "Nirvana" / "Nevermind" / "01 - Lithium.mp3"
+        tags = MutagenFile(target, easy=True)
+        self.assertEqual(tags["artist"], ["Nirvana"])
+        self.assertEqual(tags["album"], ["Nevermind"])
+        self.assertEqual(tags["title"], ["Lithium"])
+        self.assertEqual(tags["tracknumber"], ["1"])
+        self.assertEqual(organizer.stats["tags_written"], 1)
+
+    @unittest.skipUnless(MUTAGEN, "mutagen required")
+    def test_source_file_is_not_modified(self):
+        source = self.write("Nirvana/Nevermind/01 Lithium.mp3")
+        before = source.read_bytes()
+
+        organizer = self.build()
+        organizer.config.set("NAMING", "write_tags", "true")
+        organizer.organize()
+
+        self.assertEqual(source.read_bytes(), before)
+
+    def test_disabled_by_default(self):
+        self.write("Nirvana/Nevermind/01 Lithium.mp3")
+        organizer = self.build()
+        organizer.organize()
+        self.assertEqual(organizer.stats["tags_written"], 0)
+
+    @unittest.skipUnless(MUTAGEN, "mutagen required")
+    def test_manual_sort_files_are_left_untagged(self):
+        self.write("09182734.mp3")
+        organizer = self.build()
+        organizer.config.set("NAMING", "write_tags", "true")
+        organizer.organize()
+
+        self.assertEqual(organizer.stats["tags_written"], 0)
+
+
+class TestSidecars(OrganizerTestCase):
+    def test_lyrics_file_follows_the_rename(self):
+        self.write("Nirvana/Nevermind/01 Lithium.mp3")
+        (self.source / "Nirvana" / "Nevermind" / "01 Lithium.lrc").write_text(
+            "[00:01.00]words", encoding="utf-8"
+        )
+
+        organizer = self.build()
+        organizer.organize()
+
+        sidecar = organizer.organized_path / "Nirvana" / "Nevermind" / "01 - Lithium.lrc"
+        self.assertTrue(sidecar.exists())
+        self.assertEqual(sidecar.read_text(encoding="utf-8"), "[00:01.00]words")
+        self.assertEqual(organizer.stats["sidecars_copied"], 1)
+
+    def test_unlisted_extensions_are_not_copied(self):
+        self.write("Nirvana/Nevermind/01 Lithium.mp3")
+        (self.source / "Nirvana" / "Nevermind" / "01 Lithium.bak").write_text(
+            "junk", encoding="utf-8"
+        )
+
+        organizer = self.build()
+        organizer.organize()
+
+        album_dir = organizer.organized_path / "Nirvana" / "Nevermind"
+        self.assertEqual(list(album_dir.glob("*.bak")), [])
+
+    def test_folder_image_is_copied_as_folder_jpg(self):
+        self.write("Nirvana/Nevermind/01 Lithium.mp3")
+        (self.source / "Nirvana" / "Nevermind" / "cover.jpg").write_bytes(b"\xff\xd8JPEG")
+
+        organizer = self.build()
+        organizer.organize()
+
+        art = organizer.organized_path / "Nirvana" / "Nevermind" / "folder.jpg"
+        self.assertTrue(art.exists())
+        self.assertEqual(art.read_bytes(), b"\xff\xd8JPEG")
+
+    @unittest.skipUnless(MUTAGEN, "mutagen required")
+    def test_embedded_art_wins_over_a_loose_file(self):
+        path = self.write("Nirvana/Nevermind/01 Lithium.mp3")
+        tags = ID3()
+        tags.add(TPE1(encoding=3, text="Nirvana"))
+        tags.add(TALB(encoding=3, text="Nevermind"))
+        tags.add(TIT2(encoding=3, text="Lithium"))
+        tags.add(APIC(encoding=3, mime="image/jpeg", type=3, desc="Cover (front)",
+                      data=b"EMBEDDED"))
+        tags.save(path)
+        (self.source / "Nirvana" / "Nevermind" / "cover.jpg").write_bytes(b"LOOSE")
+
+        organizer = self.build()
+        organizer.organize()
+
+        art = organizer.organized_path / "Nirvana" / "Nevermind" / "folder.jpg"
+        self.assertEqual(art.read_bytes(), b"EMBEDDED")
+
+    def test_sidecars_are_undone_with_the_run(self):
+        self.write("Nirvana/Nevermind/01 Lithium.mp3")
+        (self.source / "Nirvana" / "Nevermind" / "01 Lithium.lrc").write_text(
+            "words", encoding="utf-8"
+        )
+
+        organizer = self.build()
+        organizer.organize()
+        self.build().undo_run(assume_yes=True)
+
+        self.assertFalse((organizer.organized_path / "Nirvana").exists())
+
+    def test_disabled_by_config(self):
+        self.write("Nirvana/Nevermind/01 Lithium.mp3")
+        (self.source / "Nirvana" / "Nevermind" / "01 Lithium.lrc").write_text(
+            "words", encoding="utf-8"
+        )
+
+        organizer = self.build()
+        organizer.config.set("SIDECARS", "copy_sidecars", "false")
+        organizer.organize()
+
+        self.assertEqual(organizer.stats["sidecars_copied"], 0)
+
+
+class TestParallelScanning(OrganizerTestCase):
+    def test_serial_and_parallel_agree(self):
+        for index in range(6):
+            self.write(f"Artist/Album/{index:02d} Track {index}.mp3",
+                       SILENT_MP3 + bytes([index]))
+
+        serial = self.build()
+        serial.config.set("PERFORMANCE", "workers", "1")
+        serial.organize()
+
+        hashes = sorted(r.audio_hash for r in serial.planned)
+        self.assertEqual(len(set(hashes)), 6)
+        self.assertEqual(serial.stats["organized"], 6)
+
+    def test_worker_count_respects_config(self):
+        organizer = self.build()
+        organizer.config.set("PERFORMANCE", "workers", "1")
+        self.assertEqual(organizer._worker_count(1000), 1)
+
+        organizer.config.set("PERFORMANCE", "workers", "4")
+        self.assertEqual(organizer._worker_count(1000), 4)
+
+    def test_small_batches_stay_in_one_process(self):
+        organizer = self.build()
+        organizer.config.set("PERFORMANCE", "workers", "8")
+        self.assertEqual(organizer._worker_count(3), 1)
+
+    def test_auto_worker_count_is_bounded(self):
+        organizer = self.build()
+        organizer.config.set("PERFORMANCE", "workers", "0")
+        self.assertLessEqual(organizer._worker_count(1000), 8)
+        self.assertGreaterEqual(organizer._worker_count(1000), 1)
+
+    def test_scan_payload_returns_plain_data(self):
+        path = self.write("Artist/Album/01 Track.mp3")
+        scanned = music_organizer.scan_payload(str(path))
+
+        self.assertIn("audio_hash", scanned)
+        self.assertIn("hash_scope", scanned)
+        self.assertIsInstance(scanned["audio_hash"], str)
+
+    def test_scan_payload_on_an_unreadable_file(self):
+        path = self.source / "empty.mp3"
+        path.write_bytes(b"")
+        self.assertIsNone(music_organizer.scan_payload(str(path)))
+
+
+class TestHtmlReport(OrganizerTestCase):
+    def test_report_is_written(self):
+        self.write("Nirvana/Nevermind/01 Lithium.mp3")
+        organizer = self.build()
+        organizer.organize()
+
+        report = organizer.organized_path / "Reports" / "report.html"
+        self.assertTrue(report.exists())
+        page = report.read_text(encoding="utf-8")
+        self.assertIn("Music Organizer report", page)
+        self.assertIn("Nirvana", page)
+
+    def test_report_lists_duplicates(self):
+        self.write("Artist/Album/01 Song.mp3")
+        self.write("Backup/Artist/Album/01 Song.mp3")
+        organizer = self.build()
+        organizer.organize()
+
+        page = (organizer.organized_path / "Reports" / "report.html").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn("Redundant source files", page)
+        self.assertIn("Backup", page)
+
+    def test_report_can_be_disabled(self):
+        self.write("Nirvana/Nevermind/01 Lithium.mp3")
+        organizer = self.build()
+        organizer.config.set("GENERAL", "html_report", "false")
+        organizer.organize()
+
+        self.assertFalse((organizer.organized_path / "Reports" / "report.html").exists())
+
+
+class TestInteractiveResolver(OrganizerTestCase):
+    def _answers(self, *responses):
+        queue = list(responses)
+        return lambda prompt: queue.pop(0) if queue else "q"
+
+    def test_a_group_is_filed_from_one_answer(self):
+        self.write("09182734.mp3", SILENT_MP3 + b"\x01")
+        self.write("09182735.mp3", SILENT_MP3 + b"\x02")
+        organizer = self.build()
+        organizer.organize()
+        self.assertEqual(organizer.stats["manual_sort"], 2)
+
+        resolver = self.build()
+        moved = resolver.resolve_interactive(self._answers("Autechre", "Amber"))
+
+        self.assertEqual(moved, 2)
+        outputs = self.outputs(resolver)
+        self.assertEqual(len(outputs), 2)
+        self.assertTrue(all(o.startswith("Autechre/Amber/") for o in outputs))
+
+    def test_blank_answer_skips_the_group(self):
+        self.write("09182734.mp3")
+        organizer = self.build()
+        organizer.organize()
+
+        resolver = self.build()
+        self.assertEqual(resolver.resolve_interactive(self._answers("", "q")), 0)
+        self.assertTrue((organizer.organized_path / "Manual Sort Needed"
+                         / "09182734.mp3").exists())
+
+    def test_quit_stops_immediately(self):
+        self.write("09182734.mp3")
+        organizer = self.build()
+        organizer.organize()
+
+        resolver = self.build()
+        self.assertEqual(resolver.resolve_interactive(self._answers("q")), 0)
+
+    def test_blank_album_defaults_to_singles(self):
+        self.write("09182734.mp3")
+        organizer = self.build()
+        organizer.organize()
+
+        resolver = self.build()
+        resolver.resolve_interactive(self._answers("Autechre", ""))
+
+        self.assertIn("Autechre/Singles/09182734.mp3", self.outputs(resolver))
+
+    def test_resolution_is_undoable(self):
+        self.write("09182734.mp3")
+        organizer = self.build()
+        organizer.organize()
+
+        resolver = self.build()
+        resolver.resolve_interactive(self._answers("Autechre", "Amber"))
+
+        self.build().undo_run(assume_yes=True)
+        self.assertTrue((organizer.organized_path / "Manual Sort Needed"
+                         / "09182734.mp3").exists())
+
+    def test_empty_manual_folder_is_handled(self):
+        self.write("Nirvana/Nevermind/01 Lithium.mp3")
+        organizer = self.build()
+        organizer.organize()
+
+        resolver = self.build()
+        self.assertEqual(resolver.resolve_interactive(self._answers()), 0)
 
 
 class TestManualFolder(OrganizerTestCase):

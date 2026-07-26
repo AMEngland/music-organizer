@@ -216,4 +216,7 @@ and no use of the `logging` module.
       `MAX_PATH`, which silently dropped files.
 - [x] **Tier 2** — implemented. `add_new_music.py` was deleted rather than
       merely deprecated; its behaviour lives on as `--incremental`.
-- [ ] **Tier 3**
+- [x] **Tier 3** — implemented. Fingerprinting is opt-in and degrades cleanly
+      when `fpcalc` or an API key is missing; encode-level duplicate merging is
+      opt-in on top of that, because it drops files on the strength of a network
+      lookup rather than a byte-level fact.

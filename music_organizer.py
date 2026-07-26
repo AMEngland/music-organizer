@@ -26,10 +26,16 @@ from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 
 import naming
+import report_html
 import state
 from audio_hash import hash_audio_payload
 
-__version__ = "2.0.0"
+try:
+    import fingerprint
+except ImportError:  # pragma: no cover - module ships with the tool
+    fingerprint = None
+
+__version__ = "2.1.0"
 
 # Try to import optional dependencies
 try:
@@ -83,13 +89,24 @@ _TAG_KEYS = {
 # Confidence weights. Tags are trusted most, then directory structure, then the
 # filename; a filename pattern that hinges on a single unspaced separator is
 # discounted further because it is the easiest one to get wrong.
-_ARTIST_SOURCE_SCORE = {"tags": 55, "path": 38, "filename": 26, "none": 0}
-_TITLE_SOURCE_SCORE = {"tags": 25, "filename": 12, "none": 0}
+#
+# AcoustID sits below embedded tags and above anything inferred from a path or
+# filename. That ordering is not decorative: it is also the rule that decides
+# whether an acoustic match may overwrite a field, so a user's own tags always
+# win while a folder-name guess does not.
+_ARTIST_SOURCE_SCORE = {"tags": 55, "acoustid": 50, "path": 38, "filename": 26, "none": 0}
+_TITLE_SOURCE_SCORE = {"tags": 25, "acoustid": 22, "filename": 12, "none": 0}
 _WEAK_PATTERNS = {"artist_dash_title", "artist_underscore_title", "artist_comma_title"}
 
 ROUTE_LIBRARY = "library"
 ROUTE_REVIEW = "review"
 ROUTE_MANUAL = "manual"
+
+# Below this many files to hash, process startup costs more than it saves.
+_PARALLEL_THRESHOLD = 24
+
+# Album-level artwork filenames looked for next to the source audio.
+_COVER_NAMES = ("cover", "folder", "front", "album", "albumart", "artwork")
 
 
 def fs_path(path: Path) -> str:
@@ -106,6 +123,96 @@ def fs_path(path: Path) -> str:
     if text.startswith("\\\\"):  # UNC share
         return "\\\\?\\UNC" + text[1:]
     return "\\\\?\\" + text
+
+
+def _first_tag(audio_file, keys: Sequence[str]):
+    """Return the first present tag value among *keys*, or None."""
+    for key in keys:
+        try:
+            if key not in audio_file:
+                continue
+            value = audio_file[key]
+        except (KeyError, TypeError, ValueError):
+            continue
+        if value is not None:
+            return value
+    return None
+
+
+def _as_text(value) -> Optional[str]:
+    if value is None:
+        return None
+    # Vorbis/MP4 return lists; ID3 returns frames that stringify cleanly.
+    if isinstance(value, (list, tuple)) and value:
+        value = value[0]
+    if isinstance(value, tuple) and value:  # MP4 trkn/disk pairs
+        value = value[0]
+    text = str(value).strip()
+    return text or None
+
+
+def _as_number(value) -> Optional[int]:
+    text = _as_text(value)
+    if not text:
+        return None
+    match = re.match(r"\s*(\d{1,4})", text)
+    if not match:
+        return None
+    number = int(match.group(1))
+    return number if 0 < number < 1000 else None
+
+
+def read_tags(path: Path) -> Dict:
+    """Read embedded tags and stream info. Module level so workers can use it."""
+    if not MUTAGEN_AVAILABLE:
+        return {}
+
+    try:
+        audio_file = MutagenFile(path)
+    except Exception as exc:
+        LOG.debug("Tag read failed for %s: %s", path, exc)
+        return {}
+
+    if audio_file is None:
+        return {}
+
+    tags: Dict = {
+        "bitrate": int(getattr(getattr(audio_file, "info", None), "bitrate", 0) or 0),
+        "tag_artist": _as_text(_first_tag(audio_file, _TAG_KEYS["artist"])),
+        "tag_albumartist": _as_text(_first_tag(audio_file, _TAG_KEYS["albumartist"])),
+        "tag_album": _as_text(_first_tag(audio_file, _TAG_KEYS["album"])),
+        "tag_title": _as_text(_first_tag(audio_file, _TAG_KEYS["title"])),
+        "track_number": _as_number(_first_tag(audio_file, _TAG_KEYS["track"])),
+        "disc_number": _as_number(_first_tag(audio_file, _TAG_KEYS["disc"])),
+    }
+
+    genre_value = _first_tag(audio_file, _TAG_KEYS["genre"])
+    # ID3 TCON may hold numeric references like "(13)"; mutagen expands those
+    # through .genres, so prefer it over the raw text.
+    expanded = getattr(genre_value, "genres", None)
+    tags["genre"] = _as_text(expanded[0] if expanded else genre_value)
+
+    year_text = _as_text(_first_tag(audio_file, _TAG_KEYS["year"]))
+    match = re.search(r"(\d{4})", year_text) if year_text else None
+    tags["year"] = match.group(1) if match else None
+
+    return tags
+
+
+def scan_payload(path_text: str) -> Optional[Dict]:
+    """Hash and tag one file, returning plain data.
+
+    Runs in a worker process, so it takes and returns only picklable values and
+    never touches the organizer or the database.
+    """
+    path = Path(path_text)
+    digest = hash_audio_payload(path)
+    if digest is None:
+        return None
+
+    result: Dict = {"audio_hash": digest.digest, "hash_scope": digest.scope}
+    result.update(read_tags(path))
+    return result
 
 
 @dataclass
@@ -140,6 +247,10 @@ class TrackRecord:
     filename_pattern: str = "none"
     confidence: int = 0
     route: str = ROUTE_MANUAL
+
+    # Acoustic identification, when --fingerprint is used.
+    recording_id: Optional[str] = None
+    fingerprint_score: Optional[float] = None
 
     # Filled in during planning and execution.
     target_path: Optional[Path] = None
@@ -188,6 +299,7 @@ class AdvancedMusicOrganizer:
             "extract_album_art": "true",
             "analyze_quality": "true",
             "find_near_duplicates": "true",
+            "html_report": "true",
         },
         "FOLDERS": {
             "skip_folders": "System Volume Information, $RECYCLE.BIN, .Trash",
@@ -200,11 +312,29 @@ class AdvancedMusicOrganizer:
             "max_component_length": "100",
             "titlecase_names": "true",
             "name_exceptions": "",
+            "write_tags": "false",
         },
         "CLASSIFY": {
             "review_threshold": "55",
             "route_review": "false",
             "review_folder": "Review",
+        },
+        "FINGERPRINT": {
+            "enabled": "false",
+            "api_key": "",
+            "min_score": "0.7",
+            "only_unidentified": "true",
+            "merge_duplicate_encodes": "false",
+            "rate_limit_per_second": "3",
+            "fpcalc_path": "",
+        },
+        "PERFORMANCE": {
+            "workers": "0",
+        },
+        "SIDECARS": {
+            "copy_sidecars": "true",
+            "sidecar_extensions": ".lrc, .cue, .log, .nfo, .txt",
+            "copy_folder_images": "true",
         },
         "QUALITY": {
             "min_bitrate": "128",
@@ -261,6 +391,10 @@ class AdvancedMusicOrganizer:
             "artists_merged": 0,
             "album_art_extracted": 0,
             "scans_from_cache": 0,
+            "identified_by_fingerprint": 0,
+            "encode_duplicates_merged": 0,
+            "tags_written": 0,
+            "sidecars_copied": 0,
             "errors": [],
         }
 
@@ -396,128 +530,144 @@ class AdvancedMusicOrganizer:
 
         return sorted(files)
 
-    @staticmethod
-    def _first_tag(audio_file, keys: Sequence[str]):
-        """Return the first present tag value among *keys*, or None."""
-        for key in keys:
-            try:
-                if key in audio_file:
-                    value = audio_file[key]
-                else:
-                    continue
-            except (KeyError, TypeError, ValueError):
-                continue
-            if value is None:
-                continue
-            return value
-        return None
-
-    @staticmethod
-    def _as_text(value) -> Optional[str]:
-        if value is None:
-            return None
-        # Vorbis/MP4 return lists; ID3 returns frames that stringify cleanly.
-        if isinstance(value, (list, tuple)) and value:
-            value = value[0]
-        if isinstance(value, tuple) and value:  # MP4 trkn/disk pairs
-            value = value[0]
-        text = str(value).strip()
-        return text or None
-
-    @staticmethod
-    def _as_number(value) -> Optional[int]:
-        text = AdvancedMusicOrganizer._as_text(value)
-        if not text:
-            return None
-        match = re.match(r"\s*(\d{1,4})", text)
-        if not match:
-            return None
-        number = int(match.group(1))
-        return number if 0 < number < 1000 else None
-
     def read_metadata(self, record: TrackRecord) -> None:
         """Populate *record* with embedded tag data and stream info."""
-        if not MUTAGEN_AVAILABLE:
-            return
-
-        try:
-            audio_file = MutagenFile(record.path)
-        except Exception as exc:
-            LOG.debug("Tag read failed for %s: %s", record.path, exc)
-            audio_file = None
-
-        if audio_file is None:
-            return
-
-        record.bitrate = int(getattr(getattr(audio_file, "info", None), "bitrate", 0) or 0)
-
-        record.tag_artist = self._as_text(self._first_tag(audio_file, _TAG_KEYS["artist"]))
-        record.tag_albumartist = self._as_text(
-            self._first_tag(audio_file, _TAG_KEYS["albumartist"])
-        )
-        record.tag_album = self._as_text(self._first_tag(audio_file, _TAG_KEYS["album"]))
-        record.tag_title = self._as_text(self._first_tag(audio_file, _TAG_KEYS["title"]))
-        record.track_number = self._as_number(self._first_tag(audio_file, _TAG_KEYS["track"]))
-        record.disc_number = self._as_number(self._first_tag(audio_file, _TAG_KEYS["disc"]))
-
-        genre_value = self._first_tag(audio_file, _TAG_KEYS["genre"])
-        # ID3 TCON may hold numeric references like "(13)"; mutagen expands
-        # those through .genres, so prefer it over the raw text.
-        expanded = getattr(genre_value, "genres", None)
-        record.genre = self._as_text(expanded[0] if expanded else genre_value)
-
-        year_text = self._as_text(self._first_tag(audio_file, _TAG_KEYS["year"]))
-        if year_text:
-            match = re.search(r"(\d{4})", year_text)
-            record.year = match.group(1) if match else None
+        for key, value in read_tags(record.path).items():
+            setattr(record, key, value)
 
     def scan_file(self, path: Path) -> Optional[TrackRecord]:
         """Hash and read one file, using the scan cache when it is still valid."""
+        record = self._new_record(path)
+        if record is None:
+            return None
+
+        if self._fill_from_cache(record):
+            self.analyze_quality(record)
+            return record
+
+        scanned = scan_payload(str(path))
+        if not self._apply_scan(record, scanned):
+            return None
+
+        self.analyze_quality(record)
+        return record
+
+    def _new_record(self, path: Path) -> Optional[TrackRecord]:
+        """Build an empty record with filesystem facts filled in."""
         try:
             stat_result = path.stat()
         except OSError as exc:
             self.record_error(f"Cannot stat {path}: {exc}")
             return None
 
-        record = TrackRecord(
+        return TrackRecord(
             path=path,
             size=stat_result.st_size,
             mtime=stat_result.st_mtime,
             extension=path.suffix.lower(),
         )
 
-        cached = None
+    def _fill_from_cache(self, record: TrackRecord) -> bool:
+        """Populate *record* from the scan cache. True when it was a hit."""
+        if self.database is None:
+            return False
+
+        cached = self.database.cached_scan(record.path, record.mtime, record.size)
+        if not cached:
+            return False
+
+        record.audio_hash = cached["audio_hash"]
+        record.hash_scope = cached["hash_scope"]
+        record.bitrate = cached["bitrate"]
+        for field_name in state.CACHED_TAG_FIELDS:
+            setattr(record, field_name, cached.get(field_name))
+        record.from_cache = True
+        self.stats["scans_from_cache"] += 1
+        return True
+
+    def _apply_scan(self, record: TrackRecord, scanned: Optional[Dict]) -> bool:
+        """Apply a worker result to *record* and cache it. False if unusable."""
+        if not scanned:
+            self.record_error(f"Cannot hash {record.path}")
+            return False
+
+        record.audio_hash = scanned["audio_hash"]
+        record.hash_scope = scanned["hash_scope"]
+        record.bitrate = scanned.get("bitrate", 0)
+        for field_name in state.CACHED_TAG_FIELDS:
+            if field_name in scanned:
+                setattr(record, field_name, scanned[field_name])
+
         if self.database is not None:
-            cached = self.database.cached_scan(path, record.mtime, record.size)
+            try:
+                self.database.store_scan(
+                    record.path, record.mtime, record.size, record.audio_hash,
+                    record.hash_scope, record.bitrate, record.cacheable_tags(),
+                )
+            except Exception as exc:  # pragma: no cover - cache is best effort
+                LOG.debug("Could not cache scan for %s: %s", record.path, exc)
+        return True
 
-        if cached:
-            record.audio_hash = cached["audio_hash"]
-            record.hash_scope = cached["hash_scope"]
-            record.bitrate = cached["bitrate"]
-            for field_name in state.CACHED_TAG_FIELDS:
-                setattr(record, field_name, cached.get(field_name))
-            record.from_cache = True
-            self.stats["scans_from_cache"] += 1
+    def _worker_count(self, pending: int) -> int:
+        """How many processes to hash with. 1 means stay in this process."""
+        configured = self.config.getint("PERFORMANCE", "workers", fallback=0)
+        if configured == 1 or pending < _PARALLEL_THRESHOLD:
+            return 1
+        if configured > 1:
+            return min(configured, pending)
+        return min(os.cpu_count() or 1, 8, pending)
+
+    def scan_all(self, paths: Sequence[Path]) -> List[TrackRecord]:
+        """Scan every file, in parallel when there is enough work to justify it.
+
+        Cached files are resolved in this process (a database lookup is far
+        cheaper than a task round trip); only genuine hashing work is farmed
+        out, since that is what dominates wall-clock time.
+        """
+        records: List[TrackRecord] = []
+        pending: List[TrackRecord] = []
+
+        for path in paths:
+            record = self._new_record(path)
+            if record is None:
+                continue
+            if self._fill_from_cache(record):
+                self.analyze_quality(record)
+                records.append(record)
+            else:
+                pending.append(record)
+
+        if not pending:
+            return records
+
+        workers = self._worker_count(len(pending))
+        LOG.info("Hashing %d file(s) with %d worker(s)", len(pending), workers)
+
+        if workers > 1:
+            results = self._scan_parallel(pending, workers)
         else:
-            digest = hash_audio_payload(path)
-            if digest is None:
-                self.record_error(f"Cannot hash {path}")
-                return None
-            record.audio_hash = digest.digest
-            record.hash_scope = digest.scope
-            self.read_metadata(record)
+            results = [scan_payload(str(record.path)) for record in pending]
 
-            if self.database is not None:
-                try:
-                    self.database.store_scan(
-                        path, record.mtime, record.size, record.audio_hash,
-                        record.hash_scope, record.bitrate, record.cacheable_tags(),
-                    )
-                except Exception as exc:  # pragma: no cover - cache is best effort
-                    LOG.debug("Could not cache scan for %s: %s", path, exc)
+        for record, scanned in zip(pending, results):
+            if self._apply_scan(record, scanned):
+                self.analyze_quality(record)
+                records.append(record)
 
-        self.analyze_quality(record)
-        return record
+        return records
+
+    def _scan_parallel(self, pending: Sequence[TrackRecord], workers: int) -> List[Optional[Dict]]:
+        """Hash in a process pool, falling back to serial on any pool failure."""
+        try:
+            from concurrent.futures import ProcessPoolExecutor
+
+            chunk = max(1, min(32, len(pending) // (workers * 4) or 1))
+            with ProcessPoolExecutor(max_workers=workers) as pool:
+                return list(pool.map(scan_payload,
+                                     [str(record.path) for record in pending],
+                                     chunksize=chunk))
+        except Exception as exc:
+            LOG.warning("Parallel scan unavailable (%s); falling back to one process", exc)
+            return [scan_payload(str(record.path)) for record in pending]
 
     def record_error(self, message: str) -> None:
         """Log an error and keep it for the summary report."""
@@ -644,19 +794,165 @@ class AdvancedMusicOrganizer:
             record.artist = None
             record.album = None
 
+        self.assign_route(record)
+
+    def assign_route(self, record: TrackRecord) -> None:
+        """Score the classification and decide where the track goes.
+
+        Kept separate from :meth:`classify` because acoustic identification can
+        rewrite a record afterwards, and its route has to be recomputed.
+        """
         record.confidence = self.score_confidence(record)
         threshold = self.config.getint("CLASSIFY", "review_threshold", fallback=55)
 
-        if not artist:
+        if not record.artist:
             record.route = ROUTE_MANUAL
-            self.unclassified.append(record)
-            self.stats["manual_sort"] += 1
         elif record.confidence < threshold:
             record.route = ROUTE_REVIEW
-            self.review_queue.append(record)
-            self.stats["needs_review"] += 1
         else:
             record.route = ROUTE_LIBRARY
+
+    def collect_routes(self, records: Iterable[TrackRecord]) -> None:
+        """Build the manual/review queues once every route is final."""
+        self.unclassified = [r for r in records if r.route == ROUTE_MANUAL]
+        self.review_queue = [r for r in records if r.route == ROUTE_REVIEW]
+        self.stats["manual_sort"] = len(self.unclassified)
+        self.stats["needs_review"] = len(self.review_queue)
+
+    # ------------------------------------------------------------------
+    # Acoustic identification
+    # ------------------------------------------------------------------
+
+    def build_fingerprint_service(self):
+        """Construct the AcoustID service from config and environment."""
+        if fingerprint is None:
+            return None
+
+        api_key = (self.config.get("FINGERPRINT", "api_key", fallback="").strip()
+                   or os.environ.get("ACOUSTID_API_KEY", "").strip())
+        return fingerprint.FingerprintService(
+            api_key=api_key,
+            database=self.database,
+            min_score=self.config.getfloat("FINGERPRINT", "min_score", fallback=0.7),
+            rate_limit=self.config.getfloat("FINGERPRINT", "rate_limit_per_second",
+                                            fallback=3.0),
+            fpcalc_path=self.config.get("FINGERPRINT", "fpcalc_path",
+                                        fallback="").strip() or None,
+        )
+
+    def identify_by_fingerprint(self, records: Sequence[TrackRecord]) -> None:
+        """Fill in artist/title/album for tracks metadata could not identify.
+
+        By default only tracks that reached manual sort or the review queue are
+        submitted -- fingerprinting is network-bound and rate limited, so
+        spending a lookup on a well-tagged file is waste.
+        """
+        service = self.build_fingerprint_service()
+        if service is None:
+            LOG.warning("Fingerprinting module unavailable")
+            return
+
+        if not service.available:
+            LOG.warning("Fingerprinting requested but unavailable: %s",
+                        service.unavailable_reason())
+            return
+
+        only_unidentified = self.config.getboolean(
+            "FINGERPRINT", "only_unidentified", fallback=True
+        )
+        candidates = [
+            record for record in records
+            if not only_unidentified or record.route in (ROUTE_MANUAL, ROUTE_REVIEW)
+        ]
+
+        if not candidates:
+            LOG.info("Nothing needs acoustic identification")
+            return
+
+        LOG.info("Fingerprinting %d track(s)...", len(candidates))
+
+        for index, record in enumerate(candidates, start=1):
+            if index % 25 == 0:
+                LOG.info("Fingerprinted %d/%d...", index, len(candidates))
+            try:
+                match = service.identify(record.path, record.audio_hash)
+            except Exception as exc:
+                self.record_error(f"Fingerprint failed for {record.path}: {exc}")
+                continue
+            if match is not None:
+                self._apply_match(record, match)
+
+        LOG.info("Acoustic identification: %s", service.summary())
+
+    def _apply_match(self, record: TrackRecord, match) -> None:
+        """Adopt an AcoustID result for every field it outranks.
+
+        A field is only replaced when the acoustic identification is more
+        trustworthy than whatever produced the current value, so embedded tags
+        survive while a guess from a folder name or filename gives way.
+        """
+        record.recording_id = match.recording_id
+        record.fingerprint_score = match.score
+
+        artist_rank = _ARTIST_SOURCE_SCORE["acoustid"]
+        title_rank = _TITLE_SOURCE_SCORE["acoustid"]
+        adopted = False
+
+        if match.artist and artist_rank > _ARTIST_SOURCE_SCORE.get(record.artist_source, 0):
+            record.artist = naming.normalize_title(match.artist)
+            record.artist_source = "acoustid"
+            self.artists.register(record.artist, "tags")
+            adopted = True
+
+        if match.title and title_rank > _TITLE_SOURCE_SCORE.get(record.title_source, 0):
+            record.title = naming.normalize_title(match.title)
+            record.title_source = "acoustid"
+            adopted = True
+
+        if match.album and (adopted or not record.album or record.album == "Singles"):
+            record.album = naming.normalize_title(match.album)
+
+        if record.artist and not record.album:
+            record.album = "Singles"
+        if match.year and not record.year:
+            record.year = match.year
+
+        if adopted:
+            self.stats["identified_by_fingerprint"] += 1
+
+        self.assign_route(record)
+
+    def merge_duplicate_encodes(self, records: Sequence[TrackRecord]) -> List[TrackRecord]:
+        """Collapse different encodes of the same recording into the best one.
+
+        Two rips at different bitrates have different audio and so different
+        hashes; only an acoustic match can tell they are the same performance.
+        Off by default, because it drops files on the strength of a network
+        lookup rather than a byte-level fact.
+        """
+        if not self.config.getboolean("FINGERPRINT", "merge_duplicate_encodes",
+                                      fallback=False):
+            return list(records)
+
+        groups: Dict[str, List[TrackRecord]] = defaultdict(list)
+        singles: List[TrackRecord] = []
+
+        for record in records:
+            if record.recording_id:
+                groups[record.recording_id].append(record)
+            else:
+                singles.append(record)
+
+        kept = singles
+        for members in groups.values():
+            members.sort(key=lambda item: item.quality_key, reverse=True)
+            kept.append(members[0])
+            for loser in members[1:]:
+                self.dropped_duplicates.append((loser, members[0]))
+                self.stats["encode_duplicates_merged"] += 1
+                self.stats["duplicates_skipped"] += 1
+
+        return kept
 
     # ------------------------------------------------------------------
     # Analysis
@@ -686,6 +982,11 @@ class AdvancedMusicOrganizer:
             return
 
         for record in records:
+            # An AcoustID recording is authoritative: it groups different
+            # encodes that no amount of string matching would catch.
+            if record.recording_id:
+                self.near_duplicates[f"acoustid:{record.recording_id}"].append(record)
+                continue
             if not (record.artist and record.title):
                 continue
             key = f"{naming.canonical_artist_key(record.artist)}::{_title_key(record.title)}"
@@ -926,12 +1227,135 @@ class AdvancedMusicOrganizer:
                 record.target_path = destination
                 self.stats["organized"] += 1
                 self._record_placement("copy", record.path, destination, record.audio_hash)
+                self.write_tags(record)
+                self.copy_sidecars(record)
 
             if group_name != MANUAL_SORT:
                 for record in members:
                     if record.target_path is not None:
                         self.extract_album_art(record.path, target_dir)
+                        self.copy_folder_image(record.path.parent, target_dir)
                         break
+
+    def write_tags(self, record: TrackRecord) -> None:
+        """Write the resolved metadata into the organized copy.
+
+        Only ever touches the copy, never the source, so a bad classification
+        is still recoverable by deleting the output and re-running.
+        """
+        if not MUTAGEN_AVAILABLE or self.dry_run or record.target_path is None:
+            return
+        if not self.config.getboolean("NAMING", "write_tags", fallback=False):
+            return
+        if record.route == ROUTE_MANUAL:
+            return
+
+        try:
+            audio_file = MutagenFile(fs_path(record.target_path), easy=True)
+            if audio_file is None:
+                return
+            if audio_file.tags is None:
+                audio_file.add_tags()
+
+            values = {
+                "artist": record.artist,
+                "albumartist": record.artist,
+                "album": record.album,
+                "title": record.title,
+                "genre": record.genre,
+                "date": record.year,
+                "tracknumber": str(record.track_number) if record.track_number else None,
+                "discnumber": str(record.disc_number) if record.disc_number else None,
+            }
+
+            written = False
+            for key, value in values.items():
+                if not value:
+                    continue
+                try:
+                    audio_file[key] = value
+                    written = True
+                except (KeyError, ValueError, TypeError):
+                    # Not every container supports every field; skip quietly.
+                    continue
+
+            if written:
+                audio_file.save()
+                self.stats["tags_written"] += 1
+        except Exception as exc:
+            self.record_error(f"Could not write tags to {record.target_path}: {exc}")
+
+    def _sidecar_extensions(self) -> set:
+        raw = self.config.get("SIDECARS", "sidecar_extensions", fallback="")
+        extensions = set()
+        for part in raw.split(","):
+            part = part.strip().lower()
+            if part:
+                extensions.add(part if part.startswith(".") else f".{part}")
+        return extensions
+
+    def copy_sidecars(self, record: TrackRecord) -> None:
+        """Copy per-track companion files (lyrics, cue sheets) alongside the audio.
+
+        The sidecar is renamed to match the new audio filename, otherwise
+        players stop associating the two.
+        """
+        if self.dry_run or record.target_path is None:
+            return
+        if not self.config.getboolean("SIDECARS", "copy_sidecars", fallback=True):
+            return
+
+        extensions = self._sidecar_extensions()
+        if not extensions:
+            return
+
+        source_dir = record.path.parent
+        target_stem = record.target_path.stem
+
+        for extension in sorted(extensions):
+            candidate = source_dir / f"{record.path.stem}{extension}"
+            if not os.path.exists(fs_path(candidate)):
+                continue
+
+            destination = self._resolve_collision(
+                record.target_path.with_name(f"{target_stem}{extension}")
+            )
+            try:
+                shutil.copy2(fs_path(candidate), fs_path(destination))
+            except OSError as exc:
+                self.record_error(f"Cannot copy sidecar {candidate}: {exc}")
+                continue
+
+            self.stats["sidecars_copied"] += 1
+            self._record_placement("copy", candidate, destination, None)
+
+    def copy_folder_image(self, source_dir: Path, target_dir: Path) -> None:
+        """Copy a loose cover image when nothing was embedded in the audio."""
+        if self.dry_run:
+            return
+        if not self.config.getboolean("SIDECARS", "copy_folder_images", fallback=True):
+            return
+        if any(os.path.exists(fs_path(target_dir / name))
+               for name in ("folder.jpg", "folder.png")):
+            return
+
+        for name in _COVER_NAMES:
+            for extension in (".jpg", ".jpeg", ".png"):
+                candidate = source_dir / f"{name}{extension}"
+                if not os.path.exists(fs_path(candidate)):
+                    continue
+
+                destination = target_dir / ("folder.png" if extension == ".png"
+                                            else "folder.jpg")
+                try:
+                    shutil.copy2(fs_path(candidate), fs_path(destination))
+                except OSError as exc:
+                    self.record_error(f"Cannot copy cover {candidate}: {exc}")
+                    return
+
+                self.stats["sidecars_copied"] += 1
+                self._record_placement("copy", candidate, destination, None)
+                return
 
     def _record_placement(self, action: str, source: Path, target: Path,
                           audio_hash: Optional[str]) -> None:
@@ -1059,6 +1483,87 @@ class AdvancedMusicOrganizer:
 
         LOG.info("Review queue written to %s", review_file)
         return review_file
+
+    def write_html_report(self) -> Optional[Path]:
+        """Render the run as a single self-contained HTML page."""
+        if not self.config.getboolean("GENERAL", "html_report", fallback=True):
+            return None
+
+        def describe(record: TrackRecord) -> Dict:
+            label = " - ".join(part for part in (record.artist, record.title) if part)
+            return {
+                "path": str(record.path),
+                "quality": _quality_summary(record),
+                "label": label or record.path.name,
+            }
+
+        near_groups = [
+            {
+                "label": members[0].title or key,
+                "items": [describe(member) for member in members],
+            }
+            for key, members in sorted(self.near_duplicates.items())
+            if len(members) > 1
+        ]
+
+        review_rows = [
+            {
+                "confidence": record.confidence,
+                "artist": record.artist,
+                "album": record.album,
+                "title": record.title,
+                "artist_source": record.artist_source,
+                "path": str(record.target_path or record.path),
+            }
+            for record in sorted(self.review_queue + self.unclassified,
+                                 key=lambda item: item.confidence)
+        ]
+
+        merges = {}
+        for variants in self.artists.merged_groups().values():
+            canonical = self.artists.resolve(next(iter(variants)))
+            merges[canonical] = variants.most_common()
+
+        albums: Dict[Tuple[str, str], List[str]] = defaultdict(list)
+        for record in self.planned:
+            if record.route == ROUTE_MANUAL or record.target_path is None:
+                continue
+            albums[(record.artist or "Unknown", record.album or "Singles")].append(
+                record.target_path.name
+            )
+        additions = [
+            {"artist": artist, "album": album, "tracks": sorted(tracks)}
+            for (artist, album), tracks in albums.items()
+        ]
+
+        context = {
+            "run_id": self.run_id,
+            "version": __version__,
+            "dry_run": self.dry_run,
+            "collection": str(self.organized_path),
+            "generated_at": datetime.now(),
+            "stats": {k: v for k, v in self.stats.items() if k != "errors"},
+            "additions": additions,
+            "duplicates": [(describe(loser), describe(winner))
+                           for loser, winner in self.dropped_duplicates],
+            "near_duplicates": near_groups,
+            "review": review_rows,
+            "unclassified": [str(record.path) for record in self.unclassified],
+            "artist_merges": merges,
+            "quality": dict(self.quality_stats),
+            "errors": self.stats["errors"],
+        }
+
+        self.reports_path.mkdir(parents=True, exist_ok=True)
+        report_file = self.reports_path / "report.html"
+        try:
+            report_file.write_text(report_html.render_report(context), encoding="utf-8")
+        except OSError as exc:
+            self.record_error(f"Cannot write {report_file}: {exc}")
+            return None
+
+        LOG.info("HTML report written to %s", report_file)
+        return report_file
 
     def create_playlists(self, records: Sequence[TrackRecord]) -> None:
         """Create M3U playlists"""
@@ -1222,15 +1727,15 @@ class AdvancedMusicOrganizer:
     # Driver
     # ------------------------------------------------------------------
 
-    def organize(self, reindex: bool = False) -> None:
+    def organize(self, reindex: bool = False, fingerprint_lookup: bool = False) -> None:
         """Main organization function"""
         try:
-            self._organize(reindex)
+            self._organize(reindex, fingerprint_lookup)
         finally:
             # Release the SQLite handle; callers may delete the collection.
             self.close_database()
 
-    def _organize(self, reindex: bool = False) -> None:
+    def _organize(self, reindex: bool = False, fingerprint_lookup: bool = False) -> None:
         LOG.info("Advanced Music Organizer %s", __version__)
 
         if not MUTAGEN_AVAILABLE:
@@ -1248,18 +1753,11 @@ class AdvancedMusicOrganizer:
             self.reindex_collection()
 
         all_files = self.get_all_music_files()
+        self.stats["total_files"] = len(all_files)
         LOG.info("Found %d music files", len(all_files))
 
         # Pass 1 - read and hash, reusing cached scans where possible.
-        records: List[TrackRecord] = []
-        for index, path in enumerate(all_files, start=1):
-            self.stats["total_files"] += 1
-            if index % 100 == 0:
-                LOG.info("Scanning %d/%d...", index, len(all_files))
-            record = self.scan_file(path)
-            if record is not None:
-                records.append(record)
-
+        records = self.scan_all(all_files)
         database.forget_missing_scans(all_files)
 
         # Pass 2 - collapse duplicate recordings, then drop anything the
@@ -1275,6 +1773,14 @@ class AdvancedMusicOrganizer:
         LOG.info("Classifying...")
         for record in kept:
             self.classify(record)
+
+        # Pass 3b - ask AcoustID about whatever metadata could not identify.
+        if fingerprint_lookup or self.config.getboolean("FINGERPRINT", "enabled",
+                                                        fallback=False):
+            self.identify_by_fingerprint(kept)
+            kept = self.merge_duplicate_encodes(kept)
+
+        self.collect_routes(kept)
         self.check_near_duplicates(kept)
 
         # Pass 4 - resolve canonical names and destinations.
@@ -1295,6 +1801,7 @@ class AdvancedMusicOrganizer:
         self.create_playlists(kept)
         self.generate_reports(kept)
         self.write_review_csv()
+        self.write_html_report()
 
         database.finish_run(self.run_id)
 
@@ -1398,6 +1905,117 @@ class AdvancedMusicOrganizer:
 
         database.finish_run(self.run_id)
         LOG.info("Applied %d correction(s) from %s", moved, csv_path)
+        return moved
+
+    def resolve_interactive(self, input_function=input) -> int:
+        """Walk the manual-sort pile in batches and file it with your answers.
+
+        Files are grouped by the shape the parser found and by their leading
+        token, so a folder full of ``Artist - Track.mp3`` from one artist is a
+        single question rather than fifty.
+        """
+        try:
+            return self._resolve_interactive(input_function)
+        finally:
+            self.close_database()
+
+    def _resolve_interactive(self, input_function) -> int:
+        manual_dir = self.organized_path / self.config.get(
+            "FOLDERS", "manual_sort_folder", fallback=MANUAL_SORT
+        )
+        if not manual_dir.exists():
+            LOG.error("No manual sort folder at %s", manual_dir)
+            return 0
+
+        files = [path for path in sorted(manual_dir.iterdir())
+                 if path.is_file() and path.suffix.lower() in MUSIC_EXTENSIONS]
+        if not files:
+            print("Nothing left to resolve.")
+            return 0
+
+        database = self.open_database()
+        self.run_id = database.start_run(manual_dir, sys.argv[1:], self.dry_run)
+
+        # Group by the shape the parser recognized, and -- where it managed to
+        # pull an artist out -- by that artist. Files it could make nothing of
+        # therefore arrive as one batch rather than one question each.
+        groups: Dict[Tuple[str, str], List[Path]] = defaultdict(list)
+        for path in files:
+            parsed = naming.parse_filename(path.stem)
+            artist_key = naming.canonical_artist_key(parsed.artist or "")
+            groups[(parsed.pattern, artist_key)].append(path)
+
+        ordered = sorted(groups.items(), key=lambda item: (-len(item[1]), item[0]))
+        print(f"\n{len(files)} file(s) to resolve in {len(ordered)} group(s).")
+        print("For each group: enter an artist, or press Enter to skip, or 'q' to stop.\n")
+
+        resolved = 0
+        for index, ((pattern, _token), members) in enumerate(ordered, start=1):
+            print(f"--- Group {index}/{len(ordered)}: {len(members)} file(s), "
+                  f"pattern '{pattern}'")
+            for path in members[:5]:
+                print(f"      {path.name}")
+            if len(members) > 5:
+                print(f"      ... and {len(members) - 5} more")
+
+            answer = input_function("  Artist (Enter=skip, q=quit): ").strip()
+            if answer.lower() == "q":
+                break
+            if not answer:
+                continue
+
+            album = input_function("  Album (Enter=Singles): ").strip() or "Singles"
+            resolved += self._file_group(members, answer, album)
+
+        database.finish_run(self.run_id)
+        print(f"\nResolved {resolved} file(s).")
+        if resolved and not self.dry_run:
+            print(f"Undo with: --undo {self.run_id}")
+        return resolved
+
+    def _file_group(self, paths: Sequence[Path], artist: str, album: str) -> int:
+        """Move a batch of resolved files into ``artist/album``."""
+        max_length = self.max_component_length
+        template = self.config.get("NAMING", "filename_template",
+                                   fallback="{track} - {title}")
+        template_no_track = self.config.get("NAMING", "filename_template_no_track",
+                                            fallback="{title}")
+
+        target_dir = (self.organized_path
+                      / naming.safe_component(self._present(artist), max_length)
+                      / naming.safe_component(self._present(album), max_length))
+
+        moved = 0
+        for path in paths:
+            parsed = naming.parse_filename(path.stem)
+            filename = naming.build_filename(
+                title=self._present(parsed.title) or path.stem,
+                extension=path.suffix.lower(),
+                track=parsed.track,
+                artist=artist,
+                template=template,
+                template_without_track=template_no_track,
+                max_length=max_length,
+            )
+            destination = self._resolve_collision(target_dir / filename)
+
+            if self.dry_run:
+                print(f"    would move {path.name} -> {destination.name}")
+                moved += 1
+                continue
+
+            try:
+                os.makedirs(fs_path(target_dir), exist_ok=True)
+                shutil.move(fs_path(path), fs_path(destination))
+            except OSError as exc:
+                self.record_error(f"Cannot move {path}: {exc}")
+                continue
+
+            digest = hash_audio_payload(destination)
+            self._record_placement("move", path, destination,
+                                   digest.digest if digest else None)
+            moved += 1
+
         return moved
 
     def undo_run(self, run_id: Optional[int] = None, assume_yes: bool = False) -> int:
@@ -1683,11 +2301,21 @@ def build_parser() -> argparse.ArgumentParser:
                              "anything already present (requires --output)")
     parser.add_argument("--reindex", action="store_true",
                         help="Rebuild the library index from the collection on disk")
+    parser.add_argument("--fingerprint", action="store_true",
+                        help="Identify unidentified tracks via Chromaprint/AcoustID "
+                             "(needs fpcalc on PATH and ACOUSTID_API_KEY)")
+    parser.add_argument("--write-tags", action="store_true",
+                        help="Write the resolved metadata into the organized copies")
+    parser.add_argument("--workers", type=int, metavar="N",
+                        help="Hashing processes to use (0 = auto, 1 = serial)")
 
     parser.add_argument("--manual-only",
                         help="Organize only this manual sort folder into the collection")
     parser.add_argument("--apply-csv",
                         help="Re-file tracks using a corrected review_queue.csv")
+    parser.add_argument("--resolve", action="store_true",
+                        help="Work through the manual sort folder interactively, "
+                             "in batches")
     parser.add_argument("--undo", nargs="?", const=-1, type=int, metavar="RUN_ID",
                         help="Undo a run (default: the most recent one)")
     parser.add_argument("--list-runs", action="store_true", help="Show the run history")
@@ -1713,7 +2341,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
 
     # Collection-scoped modes treat the positional argument as the collection.
     collection_modes = (args.undo is not None or args.list_runs
-                        or args.apply_csv or args.manual_only)
+                        or args.apply_csv or args.manual_only or args.resolve)
     output = args.output or (args.music_path if collection_modes else None)
 
     log_directory = Path(output).joinpath("Reports") if output else None
@@ -1743,12 +2371,21 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             organizer.apply_csv(Path(args.apply_csv))
             return 0
 
+        if args.resolve:
+            organizer.resolve_interactive()
+            return 0
+
         if args.interactive:
             organizer.config.set("GENERAL", "interactive_mode", "true")
         if args.no_rename:
             organizer.config.set("NAMING", "rename_files", "false")
+        if args.write_tags:
+            organizer.config.set("NAMING", "write_tags", "true")
+        if args.workers is not None:
+            organizer.config.set("PERFORMANCE", "workers", str(max(0, args.workers)))
 
-        organizer.organize(reindex=args.reindex or args.incremental)
+        organizer.organize(reindex=args.reindex or args.incremental,
+                           fingerprint_lookup=args.fingerprint)
         return 0
     finally:
         organizer.close_database()

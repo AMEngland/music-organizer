@@ -3,6 +3,76 @@
 All notable changes to this project. Versions follow
 [Semantic Versioning](https://semver.org/).
 
+## [2.1.0] — 2026-07-26
+
+Tier 3 of the [AUDIT.md](AUDIT.md) roadmap (items 16-21): identification for
+files that carry no usable metadata at all, and the operational polish around it.
+
+### Added
+
+- **Acoustic fingerprinting** (`fingerprint.py`, `--fingerprint`). Runs
+  Chromaprint's `fpcalc` and resolves the result against AcoustID, filling in
+  artist/title/album for tracks that tags, paths and filenames could not place.
+  - Needs `fpcalc` on PATH and an AcoustID key (`FINGERPRINT.api_key` or
+    `ACOUSTID_API_KEY`). Missing either is a warning, not a failure — the run
+    continues without it.
+  - Requests are throttled to AcoustID's 3/second guidance, and every lookup is
+    cached in the database, **negative results included**, so a second run costs
+    nothing.
+  - Only unidentified tracks are submitted by default
+    (`FINGERPRINT.only_unidentified`); spending a rate-limited lookup on a
+    well-tagged file is waste.
+  - A match may overwrite a value inferred from a path or filename, but never
+    one read from embedded tags. That ordering comes from the same source-rank
+    table that drives confidence scoring, so the two cannot drift apart.
+- **Encode-level duplicate merging** (`FINGERPRINT.merge_duplicate_encodes`,
+  default off). A 128kbps and a 320kbps rip of one performance have different
+  audio and so different hashes; only an acoustic match can tell they are the
+  same recording. Off by default because it drops files on the strength of a
+  network lookup rather than a byte-level fact.
+- **Tag write-back** (`--write-tags`, `NAMING.write_tags`). Writes the resolved
+  artist/albumartist/album/title/track/disc/genre/date into the organized copy,
+  so the library is self-describing on the next pass. Only ever touches the
+  copy, never the source.
+- **Parallel hashing** (`--workers N`, `PERFORMANCE.workers`). Uncached files are
+  hashed in a process pool; cached ones are resolved in-process because a
+  database lookup is cheaper than a task round trip. Auto-sizes to the CPU count
+  capped at 8, stays serial below 24 files, and falls back to serial if the pool
+  cannot start.
+- **Sidecar handling** (`[SIDECARS]`). Per-track companions (`.lrc`, `.cue`,
+  `.log`, `.nfo`, `.txt`) are copied alongside the audio and **renamed to match**,
+  so players keep the association. A loose `cover.jpg` / `folder.jpg` /
+  `front.jpg` is copied as the album's `folder.jpg` when nothing was embedded.
+  Both are recorded for undo.
+- **Interactive resolver** (`--resolve`). Works through the manual sort pile in
+  batches grouped by the shape the parser recognized and by parsed artist, so a
+  folder of `Artist - Track.mp3` is one question rather than fifty. Answers are
+  applied to the whole group, and the whole session is undoable.
+- **HTML report** (`report_html.py`, `Reports/report.html`). One self-contained
+  page — no scripts, no external assets, light/dark aware — with stat tiles, what
+  was added to the library, collapsible duplicate groups, a redundant-source list
+  to act on, near-duplicates, the low-confidence queue with confidence bars,
+  artist merges, quality, and errors. Disable with `GENERAL.html_report`.
+- Database schema v2 adds a `fingerprints` table. Existing databases migrate in
+  place.
+
+### Changed
+
+- Routing moved out of `classify()` into `assign_route()` / `collect_routes()`,
+  so records rewritten by acoustic identification get their route recomputed
+  rather than keeping a stale one.
+- Near-duplicate grouping keys on the AcoustID recording when one is known,
+  which catches encodes that no amount of string matching would.
+- Tag reading and hashing moved to module-level `read_tags()` / `scan_payload()`
+  so worker processes can use them.
+
+### Fixed
+
+- The interactive resolver's grouping no longer splits unparseable filenames
+  into one group per file.
+
+---
+
 ## [2.0.0] — 2026-07-26
 
 A ground-up rework driven by the findings in [AUDIT.md](AUDIT.md). The v1 tool
