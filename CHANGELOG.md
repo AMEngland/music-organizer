@@ -3,6 +3,45 @@
 All notable changes to this project. Versions follow
 [Semantic Versioning](https://semver.org/).
 
+## [3.1.0] — 2026-07-26
+
+### Changed
+
+- **The tool's own folders now sort above the artist folders.** `Reports`,
+  `Playlists`, `Manual Sort Needed` and `Review` were listed in among the bands,
+  so `Reports` landed between `Radiohead` and `R.E.M.` and was effectively
+  undiscoverable — you had to already know it existed to find it. They are now
+  `__Reports__`, `__Playlists__`, `__Manual Sort Needed__` and `__Review__`.
+
+  The affix, not the sort order, is what does the work: `_` sorts *after* A-Z in
+  raw codepoint order. File managers use a natural-language comparison
+  (`StrCmpLogicalW` on Windows) that places punctuation before alphanumerics,
+  which is what floats these to the top. Verified against that function
+  directly.
+
+- **Existing collections are migrated automatically.** A pre-3.1 collection has
+  its old folders renamed on the next run. Only folders this tool created are
+  touched, the new name has to be free, and `Reports` additionally has to
+  contain one of our own report files — so a band called Reports is left alone.
+
+### Added
+
+- `FOLDERS.reports_folder` and `FOLDERS.playlists_folder` config keys. These
+  names were previously hardcoded; all four folder names are now configurable.
+
+### Fixed
+
+- The CLI attached its log file — which creates the reports folder — before
+  running the migration. Since the migration refuses to clobber an existing
+  destination, this left a migrated collection holding both `Reports` and
+  `__Reports__`. Migration now runs first, and a test exercises the CLI path
+  rather than only the library call.
+- `organize_manual_folder()` installed a process-wide logging handler, holding
+  the log file open and preventing callers from deleting the collection
+  afterwards. Attaching log handlers is now `main()`'s job alone.
+
+---
+
 ## [3.0.0] — 2026-07-26
 
 The first release with the whole [AUDIT.md](AUDIT.md) roadmap delivered and

@@ -35,7 +35,7 @@ try:
 except ImportError:  # pragma: no cover - module ships with the tool
     fingerprint = None
 
-__version__ = "3.0.0"
+__version__ = "3.1.0"
 
 # Try to import optional dependencies
 try:
@@ -57,7 +57,22 @@ except ImportError:
 MUSIC_EXTENSIONS = {".mp3", ".m4a", ".flac", ".wav", ".aac", ".ogg", ".wma", ".opus", ".aiff"}
 LOSSLESS_EXTENSIONS = {".flac", ".wav", ".aiff", ".ape", ".wv"}
 
-MANUAL_SORT = "Manual Sort Needed"
+# The tool's own folders live alongside the artist folders, so they are named to
+# sort above them and to be obviously not a band. Without the affixes, "Reports"
+# lands between "Radiohead" and "REM" and is never found.
+MANUAL_SORT = "__Manual Sort Needed__"
+REPORTS_FOLDER = "__Reports__"
+PLAYLISTS_FOLDER = "__Playlists__"
+REVIEW_FOLDER = "__Review__"
+
+# Names used before 3.1, renamed on sight so a collection does not end up with
+# both. Each entry is (old name, new name, evidence the folder is ours).
+_LEGACY_FOLDERS = (
+    ("Reports", REPORTS_FOLDER, ("organization_summary.txt", "plan.csv",
+                                 "quality_report.txt")),
+    ("Playlists", PLAYLISTS_FOLDER, None),
+    ("Manual Sort Needed", MANUAL_SORT, None),
+)
 
 LOG = logging.getLogger("music_organizer")
 
@@ -304,6 +319,8 @@ class AdvancedMusicOrganizer:
         "FOLDERS": {
             "skip_folders": "System Volume Information, $RECYCLE.BIN, .Trash",
             "manual_sort_folder": MANUAL_SORT,
+            "reports_folder": REPORTS_FOLDER,
+            "playlists_folder": PLAYLISTS_FOLDER,
         },
         "NAMING": {
             "rename_files": "true",
@@ -317,7 +334,7 @@ class AdvancedMusicOrganizer:
         "CLASSIFY": {
             "review_threshold": "55",
             "route_review": "false",
-            "review_folder": "Review",
+            "review_folder": REVIEW_FOLDER,
         },
         "FINGERPRINT": {
             "enabled": "false",
@@ -445,7 +462,21 @@ class AdvancedMusicOrganizer:
 
     @property
     def reports_path(self) -> Path:
-        return self.organized_path / "Reports"
+        return self.organized_path / self.config.get(
+            "FOLDERS", "reports_folder", fallback=REPORTS_FOLDER
+        )
+
+    @property
+    def playlists_path(self) -> Path:
+        return self.organized_path / self.config.get(
+            "FOLDERS", "playlists_folder", fallback=PLAYLISTS_FOLDER
+        )
+
+    @property
+    def manual_sort_path(self) -> Path:
+        return self.organized_path / self.config.get(
+            "FOLDERS", "manual_sort_folder", fallback=MANUAL_SORT
+        )
 
     # ------------------------------------------------------------------
     # Persistent state
@@ -461,6 +492,36 @@ class AdvancedMusicOrganizer:
         if self.database is not None:
             self.database.close()
             self.database = None
+
+    def migrate_legacy_folders(self) -> int:
+        """Rename pre-3.1 tool folders so a collection does not end up with both.
+
+        Only folders this tool created are touched, and only when the new name
+        is free. ``Reports`` additionally has to contain one of our own report
+        files, so a genuine band called Reports is never moved.
+        """
+        renamed = 0
+        for old_name, new_name, evidence in _LEGACY_FOLDERS:
+            old_path = self.organized_path / old_name
+            new_path = self.organized_path / new_name
+
+            if old_path == new_path or not old_path.is_dir() or new_path.exists():
+                continue
+            if evidence and not any((old_path / marker).exists() for marker in evidence):
+                LOG.debug("Leaving %s alone; does not look like ours", old_path)
+                continue
+
+            try:
+                old_path.rename(new_path)
+            except OSError as exc:
+                LOG.warning("Could not rename %s to %s: %s", old_name, new_name, exc)
+                continue
+
+            LOG.info("Renamed %s to %s so it sorts above the artist folders",
+                     old_name, new_name)
+            renamed += 1
+
+        return renamed
 
     def reindex_collection(self) -> int:
         """Rebuild the library index by hashing what is already organized.
@@ -1132,11 +1193,9 @@ class AdvancedMusicOrganizer:
 
     def plan_targets(self, records: Sequence[TrackRecord]) -> Dict[str, List[TrackRecord]]:
         """Assign a destination directory and filename to every record."""
-        manual_dir = self.organized_path / self.config.get(
-            "FOLDERS", "manual_sort_folder", fallback=MANUAL_SORT
-        )
+        manual_dir = self.manual_sort_path
         review_dir = self.organized_path / self.config.get(
-            "CLASSIFY", "review_folder", fallback="Review"
+            "CLASSIFY", "review_folder", fallback=REVIEW_FOLDER
         )
         route_review = self.config.getboolean("CLASSIFY", "route_review", fallback=False)
 
@@ -1572,7 +1631,7 @@ class AdvancedMusicOrganizer:
         if not self.config.getboolean("GENERAL", "create_playlists", fallback=True):
             return
 
-        playlist_dir = self.organized_path / "Playlists"
+        playlist_dir = self.playlists_path
 
         by_genre: Dict[str, List[TrackRecord]] = defaultdict(list)
         by_year: Dict[str, List[TrackRecord]] = defaultdict(list)
@@ -1746,6 +1805,7 @@ class AdvancedMusicOrganizer:
             return
 
         self.organized_path.mkdir(parents=True, exist_ok=True)
+        self.migrate_legacy_folders()
         database = self.open_database()
         self.run_id = database.start_run(self.music_path, sys.argv[1:], self.dry_run)
 
@@ -1920,9 +1980,7 @@ class AdvancedMusicOrganizer:
             self.close_database()
 
     def _resolve_interactive(self, input_function) -> int:
-        manual_dir = self.organized_path / self.config.get(
-            "FOLDERS", "manual_sort_folder", fallback=MANUAL_SORT
-        )
+        manual_dir = self.manual_sort_path
         if not manual_dir.exists():
             LOG.error("No manual sort folder at %s", manual_dir)
             return 0
@@ -2097,7 +2155,7 @@ class AdvancedMusicOrganizer:
     def _prune_empty_directories(self) -> None:
         """Remove directories left empty by an undo."""
         protected = {self.organized_path, self.reports_path,
-                     self.organized_path / "Playlists"}
+                     self.playlists_path, self.manual_sort_path}
         for directory in sorted(self.organized_path.rglob("*"), reverse=True):
             if not directory.is_dir() or directory in protected:
                 continue
@@ -2149,9 +2207,12 @@ def _quality_summary(record: TrackRecord) -> str:
     return f"{record.extension.lstrip('.')} {kind}, {record.tag_score} tags, {record.size} bytes"
 
 
-def setup_logging(log_directory: Optional[Path], verbose: bool = False,
-                  quiet: bool = False) -> Optional[Path]:
-    """Configure console and file logging. Returns the log file path, if any."""
+def setup_logging(verbose: bool = False, quiet: bool = False) -> None:
+    """Configure console logging.
+
+    The log *file* is attached separately by :func:`attach_log_file`, because
+    its location depends on configuration that is not loaded yet at this point.
+    """
     LOG.setLevel(logging.DEBUG)
     for handler in list(LOG.handlers):
         LOG.removeHandler(handler)
@@ -2161,6 +2222,9 @@ def setup_logging(log_directory: Optional[Path], verbose: bool = False,
     console.setFormatter(logging.Formatter("%(message)s"))
     LOG.addHandler(console)
 
+
+def attach_log_file(log_directory: Optional[Path]) -> Optional[Path]:
+    """Start writing a full DEBUG transcript into *log_directory*."""
     if log_directory is None:
         return None
 
@@ -2196,6 +2260,7 @@ def organize_manual_folder(manual_folder_path: str | Path,
 
     organizer = AdvancedMusicOrganizer(manual_path, output_path=collection_path,
                                        dry_run=dry_run)
+    organizer.migrate_legacy_folders()
     database = organizer.open_database()
     organizer.run_id = database.start_run(manual_path, sys.argv[1:], dry_run)
 
@@ -2344,18 +2409,26 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                         or args.apply_csv or args.manual_only or args.resolve)
     output = args.output or (args.music_path if collection_modes else None)
 
-    log_directory = Path(output).joinpath("Reports") if output else None
-    if log_directory is None:
-        log_directory = Path(args.music_path).parent / "Music_Organized" / "Reports"
-    setup_logging(log_directory, verbose=args.verbose, quiet=args.quiet)
+    setup_logging(verbose=args.verbose, quiet=args.quiet)
 
+    # Attaching the log file is the CLI's job, not the library's: it installs a
+    # process-wide handler that keeps the file open for the run's lifetime.
     if args.manual_only:
+        probe = AdvancedMusicOrganizer(args.manual_only, args.config,
+                                       output_path=args.music_path)
+        probe.migrate_legacy_folders()
+        attach_log_file(probe.reports_path)
         organize_manual_folder(args.manual_only, args.music_path, dry_run=args.dry_run)
         return 0
 
     organizer = AdvancedMusicOrganizer(
         args.music_path, args.config, output_path=output, dry_run=args.dry_run
     )
+    # Migrate before attaching the log: attaching creates the reports folder,
+    # and a pre-existing destination is (correctly) treated as "do not clobber",
+    # which would leave the collection with both the old and the new folder.
+    organizer.migrate_legacy_folders()
+    attach_log_file(organizer.reports_path)
 
     try:
         if args.list_runs:

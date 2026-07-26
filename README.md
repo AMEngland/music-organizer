@@ -1,6 +1,6 @@
 # Music Organizer Project
 
-**Version 3.0.0**
+**Version 3.1.0**
 
 A Python music library organizer that sorts audio files into a clean
 `Artist/Album/NN - Title.ext` structure using embedded metadata, directory
@@ -67,7 +67,7 @@ files are `--manual-only` and `--apply-csv`, and both are undoable.
 
 | Flag | Purpose |
 | --- | --- |
-| `--dry-run` | Plan only. Writes `Reports/plan.csv` and nothing else. |
+| `--dry-run` | Plan only. Writes `__Reports__/plan.csv` and nothing else. |
 | `--output DIR` | Destination collection (default `<music_path>/../Music_Organized`). |
 | `--interactive` | Show a sample of the plan and confirm before writing. |
 | `--no-rename` | Keep original filenames; only reorganize folders. |
@@ -94,16 +94,16 @@ positional argument is the **collection**, not the source folder.
 
 ```bash
 python music_organizer.py "D:\Music" --dry-run
-# read Music_Organized\Reports\plan.csv, adjust config if needed
+# read Music_Organized\__Reports__\plan.csv, adjust config if needed
 python music_organizer.py "D:\Music"
 ```
 
 **Fix the files it could not identify**
 
 ```bash
-# Edit Music_Organized\Reports\review_queue.csv in a spreadsheet:
+# Edit Music_Organized\__Reports__\review_queue.csv in a spreadsheet:
 # fill in artist / album / title / track for the rows you care about.
-python music_organizer.py "D:\Music_Organized" --apply-csv "D:\Music_Organized\Reports\review_queue.csv"
+python music_organizer.py "D:\Music_Organized" --apply-csv "D:\Music_Organized\__Reports__\review_queue.csv"
 ```
 
 Rows left blank are skipped, and rows already filed correctly are no-ops, so the
@@ -139,11 +139,11 @@ Music_Organized/
 │   │   ├── 02 - Second Track.mp3
 │   │   └── folder.jpg (album art)
 │   └── Singles/
-├── Manual Sort Needed/      (files that could not be identified)
-├── Playlists/
+├── __Manual Sort Needed__/      (files that could not be identified)
+├── __Playlists__/
 │   ├── genre_Rock.m3u
 │   └── year_2023.m3u
-├── Reports/
+├── __Reports__/
 │   ├── report.html           (start here: the whole run, one page)
 │   ├── plan.csv              (every decision, with confidence)
 │   ├── review_queue.csv      (editable; feed back with --apply-csv)
@@ -175,7 +175,7 @@ into manual sort:
    files the first three could not place.
 
 A file with a usable artist but no album goes to `Artist/Singles`. Only a file
-that none of the above can identify goes to `Manual Sort Needed`.
+that none of the above can identify goes to `__Manual Sort Needed__`.
 
 An acoustic match may overwrite a value guessed from a path or filename, but
 never one read from embedded tags — your own tags always win.
@@ -191,11 +191,11 @@ source, and how much corroborating metadata exists. Roughly:
 | Artist from folder structure, album known | ~65 | filed |
 | Artist guessed from a `Artist - Title` filename | ~40 | filed, queued for review |
 | Artist guessed from a single unspaced dash | ~30 | filed, queued for review |
-| No artist anywhere | 0 | `Manual Sort Needed` |
+| No artist anywhere | 0 | `__Manual Sort Needed__` |
 
 Anything below `CLASSIFY.review_threshold` (default 55) is written to
 `review_queue.csv`. By default it still goes into the main library — set
-`route_review = true` to divert it into a `Review/` folder instead.
+`route_review = true` to divert it into a `__Review__/` folder instead.
 
 ## How Deduplication Works
 
@@ -239,11 +239,11 @@ tracks that reached the review queue or manual sort are submitted; set
 
 ## Working Through the Leftovers
 
-Two ways to clear `Manual Sort Needed`, depending on how many files there are:
+Two ways to clear `__Manual Sort Needed__`, depending on how many files there are:
 
 ```bash
 # Spreadsheet: edit Reports\review_queue.csv, then apply it
-python music_organizer.py "D:\Music_Organized" --apply-csv "D:\Music_Organized\Reports\review_queue.csv"
+python music_organizer.py "D:\Music_Organized" --apply-csv "D:\Music_Organized\__Reports__\review_queue.csv"
 
 # Terminal: answer one question per group
 python music_organizer.py "D:\Music_Organized" --resolve
@@ -255,7 +255,7 @@ single prompt. Both routes are undoable.
 
 ## Manual File Naming Convention
 
-Files in `Manual Sort Needed` can be renamed and re-ingested with
+Files in `__Manual Sort Needed__` can be renamed and re-ingested with
 `--manual-only`. All of these are understood:
 
 | Filename | Result |
@@ -291,6 +291,7 @@ backfilled on later runs, so upgrading never requires deleting it.
 | `GENERAL` | `interactive_mode`, `create_playlists`, `extract_album_art`, `analyze_quality`, `find_near_duplicates` | Feature toggles |
 | `FOLDERS` | `skip_folders` | Comma-separated folder names to skip (matched per path component) |
 | `FOLDERS` | `manual_sort_folder` | Name of the quarantine folder |
+| `FOLDERS` | `reports_folder`, `playlists_folder` | Names of the tool's own folders |
 | `NAMING` | `rename_files` | Set `false` to keep original filenames |
 | `NAMING` | `filename_template` | Default `{track} - {title}`; fields: `{track}`, `{title}`, `{artist}`, `{disc}` |
 | `NAMING` | `filename_template_no_track` | Used when no track number is known |
@@ -305,7 +306,7 @@ backfilled on later runs, so upgrading never requires deleting it.
 | `FINGERPRINT` | `merge_duplicate_encodes` | Treat matching recordings as duplicates |
 | `PERFORMANCE` | `workers` | Hashing processes (0 = auto, 1 = serial) |
 | `SIDECARS` | `copy_sidecars`, `sidecar_extensions`, `copy_folder_images` | Companion files |
-| `GENERAL` | `html_report` | Write `Reports/report.html` |
+| `GENERAL` | `html_report` | Write `__Reports__/report.html` |
 | `QUALITY` | `min_bitrate` | Threshold for the low-quality report |
 | `PLAYLISTS` | `create_by_genre`, `create_by_year`, `create_by_artist`, `min_songs_for_playlist` | Playlist rules |
 

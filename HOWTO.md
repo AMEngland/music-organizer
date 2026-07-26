@@ -3,7 +3,7 @@
 A practical guide to using the tool: what it does to your files, how to run it,
 what every option means, and how to fix the things it gets wrong.
 
-**Version 3.0.0**
+**Version 3.1.0**
 
 ---
 
@@ -62,12 +62,12 @@ You have a folder of MP3s at `D:\Music`. Do this:
 # 1. See what it plans to do. Writes a CSV, touches nothing else.
 python music_organizer.py "D:\Music" --dry-run
 
-# 2. Open D:\Music_Organized\Reports\plan.csv and skim it.
+# 2. Open D:\Music_Organized\__Reports__\plan.csv and skim it.
 
 # 3. Do it for real.
 python music_organizer.py "D:\Music"
 
-# 4. Open D:\Music_Organized\Reports\report.html to see what happened.
+# 4. Open D:\Music_Organized\__Reports__\report.html to see what happened.
 ```
 
 Your originals are untouched — the tool **copies**. The result lands in
@@ -100,7 +100,7 @@ A run goes through these stages:
 3. **Classify** — works out artist, album and title from tags, folder structure
    and filename, and scores how confident it is.
 4. **Plan** — picks the destination folder and filename for every track, and
-   writes `Reports/plan.csv`.
+   writes `__Reports__/plan.csv`.
 5. **Execute** — copies files, writes tags and sidecars, extracts album art.
 6. **Report** — playlists, an HTML report, and several text reports.
 
@@ -116,11 +116,11 @@ Music_Organized/
 │   │   ├── 02 - Second Track.mp3
 │   │   └── folder.jpg              album art
 │   └── Singles/                    tracks with no known album
-├── Manual Sort Needed/             could not be identified at all
-├── Playlists/
+├── __Manual Sort Needed__/             could not be identified at all
+├── __Playlists__/
 │   ├── genre_Rock.m3u
 │   └── year_1997.m3u
-├── Reports/
+├── __Reports__/
 │   ├── report.html                 START HERE
 │   ├── plan.csv                    every decision, machine-readable
 │   ├── review_queue.csv            editable; fix and feed back
@@ -133,6 +133,12 @@ Music_Organized/
 │   └── run_20260726_143000.log     full transcript of the run
 └── .music_organizer.db             scan cache, library index, undo log
 ```
+
+The tool's own folders are wrapped in double underscores so your file manager
+lists them above the artist folders. Without that, `Reports` sorts between
+`Radiohead` and `R.E.M.` and is essentially undiscoverable. If you prefer
+different names, set `reports_folder`, `playlists_folder`,
+`manual_sort_folder` and `review_folder` in the config.
 
 **`report.html`** is the one to open. It is a single self-contained page — no
 internet needed — with the run summary, what was added, collapsible duplicate
@@ -202,7 +208,7 @@ where the title came from, and how much corroborating data exists.
 | Folder structure, album known | ~65 | Filed |
 | `Artist - Title` filename | ~40 | Filed **and** listed in `review_queue.csv` |
 | Single unspaced dash, e.g. `Artist-Title` | ~30 | Filed **and** listed for review |
-| Nothing identifiable | 0 | `Manual Sort Needed/` |
+| Nothing identifiable | 0 | `__Manual Sort Needed__/` |
 
 Anything below `review_threshold` (default 55) is listed in
 `review_queue.csv` but still goes into the main library. If you would rather
@@ -213,10 +219,10 @@ keep uncertain material out of the library entirely, set:
 route_review = true
 ```
 
-and it goes to `Review/Artist/Album/` instead.
+and it goes to `__Review__/Artist/Album/` instead.
 
 **Only files where no artist could be determined at all end up in
-`Manual Sort Needed`.** A track with a known artist but no album goes to
+`__Manual Sort Needed__`.** A track with a known artist but no album goes to
 `Artist/Singles/`, not to the manual pile.
 
 ---
@@ -402,13 +408,13 @@ Two ways, depending on how much there is.
 
 ### A. Spreadsheet — good for bulk
 
-1. Open `Music_Organized\Reports\review_queue.csv`.
+1. Open `Music_Organized\__Reports__\review_queue.csv`.
 2. Fill in `artist`, `album`, `title`, `track` for the rows you care about.
    Leave a row's `artist` blank to skip it.
 3. Save as CSV and apply:
 
 ```bash
-python music_organizer.py "D:\Music_Organized" --apply-csv "D:\Music_Organized\Reports\review_queue.csv"
+python music_organizer.py "D:\Music_Organized" --apply-csv "D:\Music_Organized\__Reports__\review_queue.csv"
 ```
 
 Rows you did not edit are no-ops, so you can apply the same file repeatedly as
@@ -437,11 +443,11 @@ Both routes are fully undoable.
 
 ### C. Rename the files yourself
 
-If you rename files in `Manual Sort Needed` to `Artist - Title.mp3`, re-ingest
+If you rename files in `__Manual Sort Needed__` to `Artist - Title.mp3`, re-ingest
 them with:
 
 ```bash
-python music_organizer.py "D:\Music_Organized" --manual-only "D:\Music_Organized\Manual Sort Needed"
+python music_organizer.py "D:\Music_Organized" --manual-only "D:\Music_Organized\__Manual Sort Needed__"
 ```
 
 ---
@@ -552,7 +558,7 @@ path is the **organized collection**. Otherwise it is the source folder to read.
 | Option | Effect |
 | --- | --- |
 | *(none)* | Organize the source folder into a collection |
-| `--dry-run` | Plan only. Writes `Reports/plan.csv`, touches nothing else |
+| `--dry-run` | Plan only. Writes `__Reports__/plan.csv`, touches nothing else |
 | `--incremental` | Add new music to an existing collection. Requires `--output` |
 | `--manual-only DIR` | Re-ingest a manual sort folder |
 | `--apply-csv FILE` | Re-file tracks from a corrected `review_queue.csv` |
@@ -600,14 +606,16 @@ delete it when upgrading**.
 | `extract_album_art` | `true` | Save embedded artwork as `folder.jpg` |
 | `analyze_quality` | `true` | Collect bitrate and format statistics |
 | `find_near_duplicates` | `true` | Look for probable same-song matches |
-| `html_report` | `true` | Write `Reports/report.html` |
+| `html_report` | `true` | Write `__Reports__/report.html` |
 
 ### `[FOLDERS]`
 
 | Key | Default | Meaning |
 | --- | --- | --- |
 | `skip_folders` | `System Volume Information, $RECYCLE.BIN, .Trash` | Folder names to ignore. Matched per path component, not as substrings |
-| `manual_sort_folder` | `Manual Sort Needed` | Name of the quarantine folder |
+| `manual_sort_folder` | `__Manual Sort Needed__` | Name of the quarantine folder |
+| `reports_folder` | `__Reports__` | Where reports and logs go |
+| `playlists_folder` | `__Playlists__` | Where M3U playlists go |
 
 ### `[NAMING]`
 
@@ -626,8 +634,8 @@ delete it when upgrading**.
 | Key | Default | Meaning |
 | --- | --- | --- |
 | `review_threshold` | `55` | Confidence below which a track is queued for review |
-| `route_review` | `false` | `true` files uncertain tracks under `Review/` |
-| `review_folder` | `Review` | Name of that folder |
+| `route_review` | `false` | `true` files uncertain tracks under `__Review__/` |
+| `review_folder` | `__Review__` | Name of that folder |
 
 ### `[FINGERPRINT]`
 
@@ -731,9 +739,9 @@ python music_organizer.py "D:\Downloads\Music" --incremental --output "D:\Music_
 
 **"Install 'mutagen' for metadata reading"**
 Run `pip install -r requirements.txt`. Without it the tool can only use folder
-names and filenames, and most files will end up in `Manual Sort Needed`.
+names and filenames, and most files will end up in `__Manual Sort Needed__`.
 
-**Everything landed in `Manual Sort Needed`**
+**Everything landed in `__Manual Sort Needed__`**
 Usually means no tags and unhelpful filenames. In order of effort: try
 `--fingerprint`, use `--resolve` to answer in batches, or edit
 `review_queue.csv` and apply it. Check `plan.csv` to see what it inferred and
@@ -768,8 +776,8 @@ Delete the output folder, including `.music_organizer.db`, and run again. Your
 source files were never modified.
 
 **Where do errors go?**
-The end of `Reports/organization_summary.txt`, the Errors section of
-`report.html`, and in full detail in `Reports/run_<timestamp>.log`.
+The end of `__Reports__/organization_summary.txt`, the Errors section of
+`report.html`, and in full detail in `__Reports__/run_<timestamp>.log`.
 
 ---
 

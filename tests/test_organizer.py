@@ -132,7 +132,7 @@ class TestClassification(OrganizerTestCase):
         organizer.organize()
 
         outputs = self.outputs(organizer)
-        self.assertTrue(any(o.startswith("Manual Sort Needed/") for o in outputs))
+        self.assertTrue(any(o.startswith(music_organizer.MANUAL_SORT + "/") for o in outputs))
         self.assertEqual(organizer.stats["manual_sort"], 1)
 
     def test_unclassified_report_is_written(self):
@@ -140,7 +140,7 @@ class TestClassification(OrganizerTestCase):
         organizer = self.build()
         organizer.organize()
 
-        report = (organizer.organized_path / "Reports" / "unclassified.txt").read_text(
+        report = (organizer.reports_path / "unclassified.txt").read_text(
             encoding="utf-8"
         )
         self.assertIn("audio_2049.mp3", report)
@@ -268,7 +268,7 @@ class TestDeduplication(OrganizerTestCase):
         organizer = self.build()
         organizer.organize()
 
-        report = (organizer.organized_path / "Reports" / "duplicates.txt").read_text(
+        report = (organizer.reports_path / "duplicates.txt").read_text(
             encoding="utf-8"
         )
         self.assertIn("Skipped:", report)
@@ -286,7 +286,8 @@ class TestArtistFolding(OrganizerTestCase):
 
         artist_dirs = sorted(
             p.name for p in organizer.organized_path.iterdir()
-            if p.is_dir() and p.name not in {"Playlists", "Reports", "Manual Sort Needed"}
+            if p.is_dir() and p.name not in {music_organizer.PLAYLISTS_FOLDER, music_organizer.REPORTS_FOLDER,
+                                   music_organizer.MANUAL_SORT}
         )
         self.assertEqual(artist_dirs, ["The Beatles"])
 
@@ -353,7 +354,7 @@ class TestPlaylists(OrganizerTestCase):
         organizer.config.set("PLAYLISTS", "create_by_artist", "true")
         organizer.organize()
 
-        playlists = list((organizer.organized_path / "Playlists").glob("*.m3u"))
+        playlists = list(organizer.playlists_path.glob("*.m3u"))
         self.assertTrue(playlists)
         content = playlists[0].read_text(encoding="utf-8")
         self.assertNotIn("\\", content)
@@ -494,7 +495,7 @@ class TestDryRun(OrganizerTestCase):
         )
         organizer.organize()
 
-        rows = self.read_csv(organizer.organized_path / "Reports" / "plan.csv")
+        rows = self.read_csv(organizer.reports_path / "plan.csv")
         self.assertEqual(len(rows), 1)
         self.assertEqual(rows[0]["action"], "copy")
         self.assertEqual(rows[0]["artist"], "Nirvana")
@@ -509,7 +510,7 @@ class TestDryRun(OrganizerTestCase):
         )
         organizer.organize()
 
-        rows = self.read_csv(organizer.organized_path / "Reports" / "plan.csv")
+        rows = self.read_csv(organizer.reports_path / "plan.csv")
         skipped = [row for row in rows if row["action"] == "skip-duplicate"]
         self.assertEqual(len(skipped), 1)
         self.assertIn("duplicate of", skipped[0]["reason"])
@@ -631,14 +632,14 @@ class TestConfidenceRouting(OrganizerTestCase):
         organizer.config.set("CLASSIFY", "route_review", "true")
         organizer.organize()
 
-        self.assertIn("Review/Nirvana/Singles/Lithium.mp3", self.outputs(organizer))
+        self.assertIn(music_organizer.REVIEW_FOLDER + "/Nirvana/Singles/Lithium.mp3", self.outputs(organizer))
 
     def test_review_queue_csv_is_written(self):
         self.write("Nirvana-Lithium.mp3")
         organizer = self.build()
         organizer.organize()
 
-        rows = self.read_csv(organizer.organized_path / "Reports" / "review_queue.csv")
+        rows = self.read_csv(organizer.reports_path / "review_queue.csv")
         self.assertEqual(len(rows), 1)
         self.assertEqual(rows[0]["artist"], "Nirvana")
 
@@ -649,7 +650,7 @@ class TestApplyCsv(OrganizerTestCase):
         organizer = self.build()
         organizer.organize()
 
-        review_csv = organizer.organized_path / "Reports" / "review_queue.csv"
+        review_csv = organizer.reports_path / "review_queue.csv"
         rows = self.read_csv(review_csv)
         self.assertEqual(len(rows), 1)
 
@@ -662,7 +663,7 @@ class TestApplyCsv(OrganizerTestCase):
 
         self.assertTrue((organizer.organized_path / "Boards of Canada"
                          / "Music Has the Right" / "04 - Roygbiv.mp3").exists())
-        self.assertFalse((organizer.organized_path / "Manual Sort Needed"
+        self.assertFalse((organizer.manual_sort_path
                           / "09182734.mp3").exists())
 
     def test_rows_without_an_artist_are_skipped(self):
@@ -670,10 +671,10 @@ class TestApplyCsv(OrganizerTestCase):
         organizer = self.build()
         organizer.organize()
 
-        review_csv = organizer.organized_path / "Reports" / "review_queue.csv"
+        review_csv = organizer.reports_path / "review_queue.csv"
         applied = self.build()
         self.assertEqual(applied.apply_csv(review_csv), 0)
-        self.assertTrue((organizer.organized_path / "Manual Sort Needed"
+        self.assertTrue((organizer.manual_sort_path
                          / "09182734.mp3").exists())
 
     def test_unedited_rows_do_not_re_file_correctly_placed_tracks(self):
@@ -683,7 +684,7 @@ class TestApplyCsv(OrganizerTestCase):
         organizer = self.build()
         organizer.organize()
 
-        review_csv = organizer.organized_path / "Reports" / "review_queue.csv"
+        review_csv = organizer.reports_path / "review_queue.csv"
         applied = self.build()
         self.assertEqual(applied.apply_csv(review_csv), 0)
 
@@ -729,7 +730,7 @@ class TestUndo(OrganizerTestCase):
 
     def test_undo_restores_moved_files(self):
         collection = self.root / "Music_Organized"
-        manual = collection / "Manual Sort Needed"
+        manual = collection / music_organizer.MANUAL_SORT
         manual.mkdir(parents=True)
         source = manual / "Nirvana - Lithium.mp3"
         source.write_bytes(SILENT_MP3)
@@ -1109,7 +1110,7 @@ class TestHtmlReport(OrganizerTestCase):
         organizer = self.build()
         organizer.organize()
 
-        report = organizer.organized_path / "Reports" / "report.html"
+        report = organizer.reports_path / "report.html"
         self.assertTrue(report.exists())
         page = report.read_text(encoding="utf-8")
         self.assertIn("Music Organizer report", page)
@@ -1121,7 +1122,7 @@ class TestHtmlReport(OrganizerTestCase):
         organizer = self.build()
         organizer.organize()
 
-        page = (organizer.organized_path / "Reports" / "report.html").read_text(
+        page = (organizer.reports_path / "report.html").read_text(
             encoding="utf-8"
         )
         self.assertIn("Redundant source files", page)
@@ -1133,7 +1134,7 @@ class TestHtmlReport(OrganizerTestCase):
         organizer.config.set("GENERAL", "html_report", "false")
         organizer.organize()
 
-        self.assertFalse((organizer.organized_path / "Reports" / "report.html").exists())
+        self.assertFalse((organizer.reports_path / "report.html").exists())
 
 
 class TestInteractiveResolver(OrganizerTestCase):
@@ -1163,7 +1164,7 @@ class TestInteractiveResolver(OrganizerTestCase):
 
         resolver = self.build()
         self.assertEqual(resolver.resolve_interactive(self._answers("", "q")), 0)
-        self.assertTrue((organizer.organized_path / "Manual Sort Needed"
+        self.assertTrue((organizer.manual_sort_path
                          / "09182734.mp3").exists())
 
     def test_quit_stops_immediately(self):
@@ -1193,7 +1194,7 @@ class TestInteractiveResolver(OrganizerTestCase):
         resolver.resolve_interactive(self._answers("Autechre", "Amber"))
 
         self.build().undo_run(assume_yes=True)
-        self.assertTrue((organizer.organized_path / "Manual Sort Needed"
+        self.assertTrue((organizer.manual_sort_path
                          / "09182734.mp3").exists())
 
     def test_empty_manual_folder_is_handled(self):
@@ -1205,10 +1206,146 @@ class TestInteractiveResolver(OrganizerTestCase):
         self.assertEqual(resolver.resolve_interactive(self._answers()), 0)
 
 
+class TestSpecialFolderNames(OrganizerTestCase):
+    def test_tool_folders_sort_above_the_artists(self):
+        self.write("Nirvana/Nevermind/01 Lithium.mp3", SILENT_MP3 + b"\x01")
+        self.write("09182734.mp3", SILENT_MP3 + b"\x02")
+
+        organizer = self.build()
+        organizer.organize()
+
+        names = sorted(p.name for p in organizer.organized_path.iterdir() if p.is_dir())
+        tool = [n for n in names if n.startswith("__")]
+        artists = [n for n in names if not n.startswith("__")]
+
+        self.assertEqual(tool, [music_organizer.MANUAL_SORT,
+                                music_organizer.REPORTS_FOLDER])
+        self.assertEqual(artists, ["Nirvana"])
+
+        # The affix is what does the work. Note that "_" sorts *after* A-Z in
+        # raw codepoint order, so a byte-wise sort is the wrong thing to assert:
+        # file managers use a natural-language comparison (StrCmpLogicalW on
+        # Windows) that places punctuation before alphanumerics, which is what
+        # actually floats these folders to the top of the listing.
+        for name in tool:
+            self.assertTrue(name.startswith("__") and name.endswith("__"))
+
+    def test_names_are_configurable(self):
+        self.write("Nirvana/Nevermind/01 Lithium.mp3")
+        organizer = self.build()
+        organizer.config.set("FOLDERS", "reports_folder", "ZZ_Diagnostics")
+        organizer.organize()
+
+        self.assertTrue((organizer.organized_path / "ZZ_Diagnostics"
+                         / "report.html").exists())
+
+
+class TestLegacyFolderMigration(OrganizerTestCase):
+    def _collection_with_legacy(self):
+        collection = self.root / "Music_Organized"
+        (collection / "Reports").mkdir(parents=True)
+        (collection / "Reports" / "organization_summary.txt").write_text(
+            "old", encoding="utf-8"
+        )
+        (collection / "Playlists").mkdir()
+        (collection / "Playlists" / "genre_Rock.m3u").write_text("#EXTM3U", encoding="utf-8")
+        (collection / "Manual Sort Needed").mkdir()
+        (collection / "Manual Sort Needed" / "mystery.mp3").write_bytes(SILENT_MP3)
+        return collection
+
+    def _organizer_for(self, collection):
+        return AdvancedMusicOrganizer(
+            self.source, config_file=self.root / "config.ini", output_path=collection
+        )
+
+    def test_legacy_folders_are_renamed(self):
+        collection = self._collection_with_legacy()
+        organizer = self._organizer_for(collection)
+
+        self.assertEqual(organizer.migrate_legacy_folders(), 3)
+
+        self.assertTrue((collection / music_organizer.REPORTS_FOLDER
+                         / "organization_summary.txt").exists())
+        self.assertTrue((collection / music_organizer.PLAYLISTS_FOLDER
+                         / "genre_Rock.m3u").exists())
+        self.assertTrue((collection / music_organizer.MANUAL_SORT
+                         / "mystery.mp3").exists())
+        self.assertFalse((collection / "Reports").exists())
+
+    def test_migration_runs_during_organize(self):
+        collection = self._collection_with_legacy()
+        self.write("Nirvana/Nevermind/01 Lithium.mp3")
+
+        organizer = self._organizer_for(collection)
+        organizer.organize()
+
+        self.assertFalse((collection / "Reports").exists())
+        self.assertTrue((collection / music_organizer.REPORTS_FOLDER).exists())
+
+    def test_a_band_called_reports_is_not_touched(self):
+        collection = self.root / "Music_Organized"
+        (collection / "Reports").mkdir(parents=True)
+        (collection / "Reports" / "Album").mkdir()
+        (collection / "Reports" / "Album" / "01 Song.mp3").write_bytes(SILENT_MP3)
+
+        organizer = self._organizer_for(collection)
+
+        self.assertEqual(organizer.migrate_legacy_folders(), 0)
+        self.assertTrue((collection / "Reports" / "Album" / "01 Song.mp3").exists())
+
+    def test_migration_does_not_clobber_an_existing_new_folder(self):
+        collection = self._collection_with_legacy()
+        (collection / music_organizer.REPORTS_FOLDER).mkdir()
+        (collection / music_organizer.REPORTS_FOLDER / "keep.txt").write_text(
+            "new", encoding="utf-8"
+        )
+
+        organizer = self._organizer_for(collection)
+        organizer.migrate_legacy_folders()
+
+        self.assertTrue((collection / "Reports").exists())
+        self.assertEqual(
+            (collection / music_organizer.REPORTS_FOLDER / "keep.txt").read_text(
+                encoding="utf-8"),
+            "new",
+        )
+
+    def test_cli_migrates_before_it_creates_the_log_folder(self):
+        # Regression: attaching the log file creates the reports folder, and a
+        # pre-existing destination is treated as "do not clobber" -- so if the
+        # log is attached first, the old folder is never renamed and the
+        # collection ends up with both.
+        collection = self._collection_with_legacy()
+        self.write("Nirvana/Nevermind/01 Lithium.mp3")
+
+        try:
+            music_organizer.main([
+                str(self.source), "--output", str(collection),
+                "--config", str(self.root / "config.ini"), "--quiet",
+            ])
+        finally:
+            for handler in list(music_organizer.LOG.handlers):
+                handler.close()
+                music_organizer.LOG.removeHandler(handler)
+
+        self.assertFalse((collection / "Reports").exists())
+        self.assertFalse((collection / "Playlists").exists())
+        self.assertFalse((collection / "Manual Sort Needed").exists())
+        self.assertTrue((collection / music_organizer.REPORTS_FOLDER
+                         / "report.html").exists())
+
+    def test_migration_is_a_no_op_on_a_fresh_collection(self):
+        self.write("Nirvana/Nevermind/01 Lithium.mp3")
+        organizer = self.build()
+        organizer.organize()
+
+        self.assertEqual(organizer.migrate_legacy_folders(), 0)
+
+
 class TestManualFolder(OrganizerTestCase):
     def test_manual_folder_files_are_moved_and_renamed(self):
         collection = self.root / "Music_Organized"
-        manual = collection / "Manual Sort Needed"
+        manual = collection / music_organizer.MANUAL_SORT
         manual.mkdir(parents=True)
         (manual / "Nirvana - Lithium.mp3").write_bytes(SILENT_MP3)
         (manual / "09182734.mp3").write_bytes(SILENT_MP3 + b"\x07")

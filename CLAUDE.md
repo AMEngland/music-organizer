@@ -5,7 +5,7 @@ Python CLI that organizes a messy music collection into
 names. Windows-first, but pure `pathlib` and platform-guarded, so it runs
 anywhere.
 
-**Current version: 3.0.0.** v1 was the original single-file tool; v2 is the
+**Current version: 3.1.0.** v1 was the original single-file tool; v2 is the
 post-audit rewrite. See [AUDIT.md](AUDIT.md) for why, [CHANGELOG.md](CHANGELOG.md)
 for what.
 
@@ -64,7 +64,7 @@ classification and their routes have to be recomputed.
   with a particular name. The original `== 'Music'` sentinel is the reason most
   of the library ended up unclassified.
 - **An implausible artist guess is discarded**, not written to disk. A junk
-  folder is worse than a file in `Manual Sort Needed`.
+  folder is worse than a file in `__Manual Sort Needed__`.
 - **Filesystem access goes through `fs_path()`** so Windows long paths work.
 - **Source-ranking is one table, used twice.** `_ARTIST_SOURCE_SCORE` /
   `_TITLE_SOURCE_SCORE` drive both the confidence score and the decision about
@@ -75,6 +75,19 @@ classification and their routes have to be recomputed.
   values, or the process pool breaks on Windows spawn.
 - **Release the SQLite handle** (`close_database()`) at the end of every public
   entry point; Windows will not let the directory be deleted otherwise.
+- **The tool's own folders are affixed** (`__Reports__`, `__Playlists__`,
+  `__Manual Sort Needed__`, `__Review__`) so file managers float them above the
+  artist folders. Do not try to prove this with codepoint order: `_` sorts
+  *after* A-Z in raw bytes. Explorer uses `StrCmpLogicalW`, which places
+  punctuation before alphanumerics, and that is what makes the affix work.
+- **Migrate before attaching the log file.** `attach_log_file()` creates the
+  reports folder, and `migrate_legacy_folders()` deliberately refuses to
+  clobber an existing destination — so attaching first silently leaves a
+  collection holding both `Reports` and `__Reports__`.
+- **Logging handlers are installed by `main()` only.** Library code must never
+  call `attach_log_file()`: it holds the file open for the process lifetime and
+  breaks any caller that deletes the collection afterwards, the test suite
+  included.
 
 ## Conventions
 
@@ -87,7 +100,9 @@ classification and their routes have to be recomputed.
   the key. `load_config()` backfills missing sections, so never require the file
   to be deleted on upgrade.
 - New config keys go in `AdvancedMusicOrganizer.DEFAULTS` **and**
-  `music_organizer_config.ini` **and** the README table.
+  `music_organizer_config.ini` **and** the README table **and** the
+  [HOWTO.md](HOWTO.md) settings reference. A key documented in only some of
+  those is worse than one documented nowhere.
 
 ## Testing
 
@@ -117,3 +132,40 @@ Pipeline tests replace the whole service by assigning to
 ## Roadmap
 
 Tiers 1, 2 and 3 in [AUDIT.md](AUDIT.md) are complete.
+
+### Considered but not built: reclaiming source disk space
+
+The organizer copies, so a run needs room for the source *and* the output — a
+1 GB library wants ~2 GB while both exist. The organized copy is at most the
+size of the source (duplicates are skipped) plus a few percent for extracted
+album art, the database, reports and logs.
+
+Two ways to avoid the doubling have been discussed and deliberately **not**
+implemented. Either is straightforward to add; neither should be added without
+the user explicitly asking, because both break the invariant that makes this
+tool safe to point at an unfamiliar library.
+
+**Option A — `--move`.** Move instead of copy. Cheapest in disk terms, worst in
+safety terms: a misclassification is no longer free, because the original is
+gone. If built, it must still write an `operations` row per file so `--undo`
+can move each one back, and it must refuse to run alongside `--dry-run`.
+
+**Option B — `--prune-source`.** Copy as now, then delete each source file only
+after verifying its copy. This is the safer shape and the one to prefer.
+Requirements:
+
+- Verify by **re-hashing the destination** and comparing to the recorded audio
+  hash. A size comparison is not sufficient.
+- Delete only files that were actually copied in *this* run. Never delete a
+  source whose copy failed, was skipped as a duplicate, or was already in the
+  library — the whole point of the duplicates report is that the user decides
+  what to do with redundant originals.
+- Require an explicit confirmation or `--yes`, like `--undo` does.
+- Understand that this makes `--undo` for that run meaningless: undo deletes the
+  organized copies and expects the originals to still exist. Either block undo
+  for pruned runs or make pruning a separate, later command against a completed
+  run.
+
+Whichever is built, the existing safety scaffolding — the operation log, the
+content check before touching a file, the confirmation prompt — is the model to
+follow, not something to work around.
