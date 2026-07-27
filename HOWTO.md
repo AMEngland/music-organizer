@@ -3,7 +3,7 @@
 A practical guide to using the tool: what it does to your files, how to run it,
 what every option means, and how to fix the things it gets wrong.
 
-**Version 3.1.0**
+**Version 3.2.0**
 
 ---
 
@@ -170,9 +170,23 @@ from another:
 | 4 | **Filename** | See the patterns below |
 
 Folder structure handles both `Artist/Album/track.mp3` and
-`Genre/Artist/Album/track.mp3`. Generic container folders (`Downloads`, `mp3s`,
-`Amazon MP3`, `Various Artists`, `misc`, …) are ignored when looking for an
-artist, and `CD1` / `Disc 2` folders become disc numbers rather than album names.
+`Genre/Artist/Album/track.mp3`. `CD1` / `Disc 2` folders become disc numbers
+rather than album names.
+
+**Container folders.** A folder that wraps the whole library — `All Music`,
+`Downloads`, `mp3s`, `My Collection` — must not be read as an artist, or every
+real artist inside it gets filed as one of its "albums". Two mechanisms stop
+that:
+
+1. A built-in list of common wrapper names, extendable with
+   `FOLDERS.container_folders`.
+2. Tag evidence: if a folder's subfolders are named after artists your tags
+   know about, and the folder itself is not, it is a container.
+
+There is deliberately **no** guess based on size or fan-out. `All Music/Nirvana/`
+and `Frank Zappa/Album 01/` are the same shape, so any such rule would shatter a
+prolific artist into one "artist" per album. If a wrapper in an untagged library
+slips through, name it in `container_folders` and re-run.
 
 Filename patterns understood:
 
@@ -616,6 +630,7 @@ delete it when upgrading**.
 | `manual_sort_folder` | `__Manual Sort Needed__` | Name of the quarantine folder |
 | `reports_folder` | `__Reports__` | Where reports and logs go |
 | `playlists_folder` | `__Playlists__` | Where M3U playlists go |
+| `container_folders` | *(empty)* | Extra folder names that wrap a library rather than naming an artist |
 
 ### `[NAMING]`
 
@@ -636,6 +651,7 @@ delete it when upgrading**.
 | `review_threshold` | `55` | Confidence below which a track is queued for review |
 | `route_review` | `false` | `true` files uncertain tracks under `__Review__/` |
 | `review_folder` | `__Review__` | Name of that folder |
+| `detect_containers` | `true` | Infer container folders from tag evidence |
 
 ### `[FINGERPRINT]`
 
@@ -770,6 +786,16 @@ A path length problem. Long paths are handled automatically, but you can lower
 The first run hashes everything. Later runs use the cache. If files keep getting
 re-hashed, something is changing their modification time — a sync client, for
 example.
+
+**It made a folder named after one of my own folders, with artists inside it**
+That folder was read as an artist. Add it to `FOLDERS.container_folders` and
+re-run. See the container-folder note in section 5.
+
+**It refuses to run, saying the source is already an organized collection**
+That guard exists to stop you copying your library a second time. If you meant
+to add new music, use `--incremental --output <collection>`. If you meant to
+re-run in place, pass `--output <that same collection>`. If you really do want a
+second copy, add `--yes`.
 
 **I want to start completely over**
 Delete the output folder, including `.music_organizer.db`, and run again. Your

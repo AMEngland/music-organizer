@@ -1206,6 +1206,169 @@ class TestInteractiveResolver(OrganizerTestCase):
         self.assertEqual(resolver.resolve_interactive(self._answers()), 0)
 
 
+class TestContainerFolders(OrganizerTestCase):
+    """A folder wrapping the whole library must not become an artist.
+
+    ``All Music/Nirvana/x.mp3`` and ``Nirvana/Nevermind/x.mp3`` are the same
+    shape, so the parser used to read the wrapper as the artist and the real
+    artist as an album.
+    """
+
+    def _tagged(self, relative, artist, album, title, track, payload):
+        path = self.write(relative, payload)
+        if MUTAGEN:
+            tags = ID3()
+            tags.add(TPE1(encoding=3, text=artist))
+            tags.add(TALB(encoding=3, text=album))
+            tags.add(TIT2(encoding=3, text=title))
+            tags.add(TRCK(encoding=3, text=str(track)))
+            tags.save(path)
+        return path
+
+    def test_named_container_is_not_an_artist(self):
+        for index, artist in enumerate(["Nirvana", "Portishead"], start=1):
+            self.write(f"All Music/{artist}/01 track.mp3", SILENT_MP3 + bytes([index]))
+
+        organizer = self.build()
+        organizer.organize()
+
+        outputs = self.outputs(organizer)
+        self.assertFalse(any(o.startswith("All Music/") for o in outputs))
+        self.assertIn("Nirvana/Singles/01 - Track.mp3", outputs)
+        self.assertIn("Portishead/Singles/01 - Track.mp3", outputs)
+
+    def test_extra_container_names_can_be_configured(self):
+        self.write("Steves Rips/Nirvana/01 track.mp3")
+
+        organizer = self.build()
+        organizer.config.set("FOLDERS", "container_folders", "Steves Rips")
+        organizer.organize()
+
+        self.assertIn("Nirvana/Singles/01 - Track.mp3", self.outputs(organizer))
+
+    @unittest.skipUnless(MUTAGEN, "mutagen required")
+    def test_unlisted_container_detected_from_tag_evidence(self):
+        # Untagged files under a wrapper whose children are artists the tags
+        # elsewhere in the collection know about.
+        for index, artist in enumerate(["Nirvana", "Portishead"], start=1):
+            self.write(f"Andys Rips 2019/{artist}/01 track.mp3",
+                       SILENT_MP3 + bytes([index]))
+            self._tagged(f"Sorted/{artist}/Real Album/01 song.mp3", artist,
+                         "Real Album", "Song", 1, SILENT_MP3 + bytes([index + 50]))
+
+        organizer = self.build()
+        organizer.organize()
+
+        outputs = self.outputs(organizer)
+        self.assertFalse(any(o.startswith("Andys Rips 2019/") for o in outputs))
+        self.assertIn("Nirvana/Singles/01 - Track.mp3", outputs)
+        self.assertIn("Nirvana/Real Album/01 - Song.mp3", outputs)
+
+    @unittest.skipUnless(MUTAGEN, "mutagen required")
+    def test_a_tagged_artist_is_never_called_a_container(self):
+        # A prolific artist has the same shape as a container. The tags settle it.
+        for index in range(1, 10):
+            self._tagged(f"Frank Zappa/Album {index:02d}/01 song.mp3", "Frank Zappa",
+                         f"Album {index:02d}", f"Song {index}", 1,
+                         SILENT_MP3 + bytes([index]))
+
+        organizer = self.build()
+        organizer.organize()
+
+        artists = {o.split("/")[0] for o in self.outputs(organizer)}
+        self.assertEqual(artists, {"Frank Zappa"})
+
+    def test_untagged_prolific_artist_is_left_alone(self):
+        # No tags anywhere, so there is no sound way to tell this from a
+        # container. The safe answer is to leave it as one artist rather than
+        # shatter it into one "artist" per album.
+        for index in range(1, 13):
+            self.write(f"Frank Zappa/Album {index:02d}/01 song.mp3",
+                       SILENT_MP3 + bytes([index]))
+
+        organizer = self.build()
+        organizer.organize()
+
+        artists = {o.split("/")[0] for o in self.outputs(organizer)}
+        self.assertEqual(artists, {"Frank Zappa"})
+
+    @unittest.skipUnless(MUTAGEN, "mutagen required")
+    def test_self_titled_album_survives(self):
+        self._tagged("Weezer/Weezer/01 song.mp3", "Weezer", "Weezer", "Undone", 1,
+                     SILENT_MP3 + b"\x01")
+        self._tagged("Weezer/Pinkerton/01 song.mp3", "Weezer", "Pinkerton",
+                     "El Scorcho", 1, SILENT_MP3 + b"\x02")
+
+        organizer = self.build()
+        organizer.organize()
+
+        outputs = self.outputs(organizer)
+        self.assertIn("Weezer/Weezer/01 - Undone.mp3", outputs)
+        self.assertIn("Weezer/Pinkerton/01 - El Scorcho.mp3", outputs)
+
+    def test_detection_can_be_disabled(self):
+        self.write("Andys Rips 2019/Nirvana/01 track.mp3")
+        organizer = self.build()
+        organizer.config.set("CLASSIFY", "detect_containers", "false")
+        organizer.organize()
+
+        self.assertEqual(organizer.detected_containers, set())
+
+
+class TestDuplicateCollectionGuard(OrganizerTestCase):
+    def _make_collection(self, name="Music_Organized"):
+        self.write("Nirvana/Nevermind/01 Lithium.mp3")
+        collection = self.root / name
+        organizer = AdvancedMusicOrganizer(
+            self.source, config_file=self.root / "config.ini", output_path=collection
+        )
+        organizer.organize()
+        return collection
+
+    def test_refuses_to_copy_a_collection_into_a_new_one(self):
+        collection = self._make_collection("My Organized Music")
+        second = self.root / "Second_Copy"
+
+        organizer = AdvancedMusicOrganizer(
+            collection, config_file=self.root / "config2.ini", output_path=second
+        )
+        organizer.organize()
+
+        self.assertFalse(second.exists())
+        self.assertEqual(organizer.stats["organized"], 0)
+
+    def test_in_place_rerun_is_allowed(self):
+        collection = self._make_collection()
+
+        organizer = AdvancedMusicOrganizer(
+            collection, config_file=self.root / "config2.ini", output_path=collection
+        )
+        organizer.organize()
+
+        # Allowed, and a no-op because everything is already in the index.
+        self.assertEqual(organizer.stats["organized"], 0)
+        self.assertEqual(organizer.stats["already_in_library"], 1)
+
+    def test_override_with_assume_yes(self):
+        collection = self._make_collection("My Organized Music")
+        second = self.root / "Second_Copy"
+
+        organizer = AdvancedMusicOrganizer(
+            collection, config_file=self.root / "config2.ini", output_path=second
+        )
+        organizer.organize(assume_yes=True)
+
+        self.assertEqual(organizer.stats["organized"], 1)
+
+    def test_a_plain_music_folder_is_not_mistaken_for_a_collection(self):
+        self.write("Nirvana/Nevermind/01 Lithium.mp3")
+        organizer = self.build()
+
+        self.assertFalse(organizer.looks_like_a_collection(self.source))
+        organizer.organize()
+        self.assertEqual(organizer.stats["organized"], 1)
+
+
 class TestSpecialFolderNames(OrganizerTestCase):
     def test_tool_folders_sort_above_the_artists(self):
         self.write("Nirvana/Nevermind/01 Lithium.mp3", SILENT_MP3 + b"\x01")

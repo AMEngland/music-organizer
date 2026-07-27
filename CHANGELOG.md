@@ -3,6 +3,58 @@
 All notable changes to this project. Versions follow
 [Semantic Versioning](https://semver.org/).
 
+## [3.2.0] — 2026-07-26
+
+### Fixed
+
+- **A folder wrapping the library was filed as an artist.** A real run produced
+  an `All Music/` folder holding a gigabyte of correctly-named artist folders,
+  while those same artists also existed at the top level.
+
+  `parse_from_path` took the two directories nearest the file, which is right
+  for `Nirvana/Nevermind/track.mp3` but wrong for `All Music/Nirvana/track.mp3`
+  — identical shapes, so the wrapper became the artist and the artist became the
+  album. Nothing in the code ever created that folder; it was the user's own
+  folder name, promoted.
+
+  Two mechanisms now prevent it:
+
+  - The built-in list of container names gained the obvious omissions
+    (`all music`, `my collection`, `music library`, `archive`, `backup`, and
+    others), and is extendable per-collection with `FOLDERS.container_folders`.
+  - `detect_containers()` infers them from the collection itself: a folder whose
+    subfolders are named after artists the tags know about, while the folder
+    itself is not, is a container. This catches wrappers nobody thought to list.
+
+  There is deliberately **no** structural fallback based on file counts or
+  fan-out. `All Music/Nirvana/x.mp3` and `Frank Zappa/Album 01/x.mp3` are the
+  same shape, so a count-based rule shatters a prolific artist into one "artist"
+  per album — confirmed by building exactly that case, watching Frank Zappa
+  become twelve artists, and removing the rule. In an untagged library, name the
+  wrapper in `container_folders`.
+
+- **Running against an existing collection is refused rather than duplicated.**
+  Pointing the tool at an already-organized folder without naming that same
+  folder as the output would copy the entire library again, leaving two
+  organized copies plus the original — unrecoverable in any cheap way at 70 GB.
+  It now stops with an explanation and the three commands that were probably
+  meant instead, exits 2, and creates nothing. `--yes` overrides. Running in
+  place (`--output` pointing at the same folder) is unaffected and remains a
+  no-op when nothing has changed.
+
+  The check runs before the log file is attached, since attaching creates the
+  destination folder — the same ordering trap fixed for folder migration in
+  3.1.0.
+
+### Added
+
+- `FOLDERS.container_folders` — extra folder names that wrap a library rather
+  than naming an artist.
+- `CLASSIFY.detect_containers` — infer containers from tag evidence
+  (default `true`).
+
+---
+
 ## [3.1.0] — 2026-07-26
 
 ### Changed

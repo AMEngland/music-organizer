@@ -1,6 +1,6 @@
 # Music Organizer Project
 
-**Version 3.1.0**
+**Version 3.2.0**
 
 A Python music library organizer that sorts audio files into a clean
 `Artist/Album/NN - Title.ext` structure using embedded metadata, directory
@@ -117,6 +117,11 @@ python music_organizer.py "D:\NewAlbums" --incremental --output "D:\Music_Organi
 
 Anything already in the collection is skipped by audio hash — including copies
 that were renamed or retagged since.
+
+Pointing the tool at an existing collection *without* naming it as the output is
+refused, because that would copy the whole library a second time. Use
+`--incremental --output <collection>` to add to it, or `--output <collection>`
+to re-run in place.
 
 **Back out a run**
 
@@ -292,6 +297,8 @@ backfilled on later runs, so upgrading never requires deleting it.
 | `FOLDERS` | `skip_folders` | Comma-separated folder names to skip (matched per path component) |
 | `FOLDERS` | `manual_sort_folder` | Name of the quarantine folder |
 | `FOLDERS` | `reports_folder`, `playlists_folder` | Names of the tool's own folders |
+| `FOLDERS` | `container_folders` | Extra folder names that wrap a library rather than naming an artist |
+| `CLASSIFY` | `detect_containers` | Infer container folders from tag evidence |
 | `NAMING` | `rename_files` | Set `false` to keep original filenames |
 | `NAMING` | `filename_template` | Default `{track} - {title}`; fields: `{track}`, `{title}`, `{artist}`, `{disc}` |
 | `NAMING` | `filename_template_no_track` | Used when no track number is known |
@@ -308,6 +315,7 @@ backfilled on later runs, so upgrading never requires deleting it.
 | `SIDECARS` | `copy_sidecars`, `sidecar_extensions`, `copy_folder_images` | Companion files |
 | `GENERAL` | `html_report` | Write `__Reports__/report.html` |
 | `QUALITY` | `min_bitrate` | Threshold for the low-quality report |
+| `QUALITY` | `preferred_format`, `report_low_quality` | Quality report tuning |
 | `PLAYLISTS` | `create_by_genre`, `create_by_year`, `create_by_artist`, `min_songs_for_playlist` | Playlist rules |
 
 ### Name casing

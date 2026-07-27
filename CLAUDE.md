@@ -5,7 +5,7 @@ Python CLI that organizes a messy music collection into
 names. Windows-first, but pure `pathlib` and platform-guarded, so it runs
 anywhere.
 
-**Current version: 3.1.0.** v1 was the original single-file tool; v2 is the
+**Current version: 3.2.0.** v1 was the original single-file tool; v2 is the
 post-audit rewrite. See [AUDIT.md](AUDIT.md) for why, [CHANGELOG.md](CHANGELOG.md)
 for what.
 

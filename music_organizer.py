@@ -35,7 +35,7 @@ try:
 except ImportError:  # pragma: no cover - module ships with the tool
     fingerprint = None
 
-__version__ = "3.1.0"
+__version__ = "3.2.0"
 
 # Try to import optional dependencies
 try:
@@ -85,6 +85,12 @@ _GENERIC_DIRS = {
         "various artists", "unknown artist", "unknown", "downloads", "download",
         "media", "audio", "albums", "songs", "tracks", "new", "sorted",
         "unsorted", "temp", "untitled", "compilations", "library",
+        # Whole-collection wrappers. This list can only ever cover the names
+        # someone thought of, which is why detect_containers() exists.
+        "all music", "all songs", "all audio", "my collection", "collection",
+        "music library", "media library", "audio files", "music files",
+        "everything", "full library", "backup", "archive", "old music",
+        "new music", "music backup", "ipod", "ipod music", "windows media",
     )
 }
 
@@ -321,6 +327,7 @@ class AdvancedMusicOrganizer:
             "manual_sort_folder": MANUAL_SORT,
             "reports_folder": REPORTS_FOLDER,
             "playlists_folder": PLAYLISTS_FOLDER,
+            "container_folders": "",
         },
         "NAMING": {
             "rename_files": "true",
@@ -335,6 +342,7 @@ class AdvancedMusicOrganizer:
             "review_threshold": "55",
             "route_review": "false",
             "review_folder": REVIEW_FOLDER,
+            "detect_containers": "true",
         },
         "FINGERPRINT": {
             "enabled": "false",
@@ -383,6 +391,8 @@ class AdvancedMusicOrganizer:
 
         self.database: Optional[state.LibraryDatabase] = None
         self.run_id: Optional[int] = None
+        #: Canonical keys of folders found to be containers, not artists.
+        self.detected_containers: set = set()
 
         self.duplicate_groups: Dict[str, List[TrackRecord]] = {}
         self.dropped_duplicates: List[Tuple[TrackRecord, TrackRecord]] = []
@@ -543,6 +553,39 @@ class AdvancedMusicOrganizer:
 
         LOG.info("Indexed %d files already in the collection", indexed)
         return indexed
+
+    def looks_like_a_collection(self, path: Path) -> bool:
+        """True if *path* is already one of our organized collections."""
+        return (os.path.exists(fs_path(path / state.DB_FILENAME))
+                or os.path.isdir(fs_path(path / REPORTS_FOLDER))
+                or os.path.isdir(fs_path(path / "Reports")))
+
+    def check_not_duplicating_a_collection(self, assume_yes: bool = False) -> bool:
+        """Refuse to copy an organized collection into a *second* collection.
+
+        Pointing the tool at an existing collection without naming that same
+        folder as the output would copy the whole library again, leaving two
+        organized copies plus the original. Nothing about that is recoverable
+        cheaply at 70 GB, so it is a hard stop rather than a warning.
+        """
+        if _same_path(self.music_path, self.organized_path):
+            return True  # organizing a collection in place is fine
+        if not self.looks_like_a_collection(self.music_path):
+            return True
+
+        LOG.error("%s is already an organized collection, and the output is a "
+                  "different folder (%s).", self.music_path, self.organized_path)
+        LOG.error("Running this would copy the whole library a second time.")
+        LOG.error("Did you mean one of these?")
+        LOG.error("  Add new music to it:   --incremental --output \"%s\"",
+                  self.music_path)
+        LOG.error("  Re-run it in place:    --output \"%s\"", self.music_path)
+        LOG.error("  Rebuild from source:   point at your original music folder")
+        if assume_yes:
+            LOG.warning("Proceeding anyway because --yes was given.")
+            return True
+        LOG.error("Pass --yes if you really do want a second copy.")
+        return False
 
     def _collection_has_music(self) -> bool:
         """True if the destination already holds audio files."""
@@ -739,19 +782,29 @@ class AdvancedMusicOrganizer:
     # Classification
     # ------------------------------------------------------------------
 
-    def parse_from_path(self, path: Path) -> Tuple[Optional[str], Optional[str], Optional[int]]:
-        """Infer ``(artist, album, disc)`` from directories below the scan root.
+    def _configured_containers(self) -> set:
+        """Canonical keys of folder names that name a container, not an artist."""
+        raw = self.config.get("FOLDERS", "container_folders", fallback="")
+        extra = {naming.canonical_artist_key(part.strip())
+                 for part in raw.split(",") if part.strip()}
+        return (_GENERIC_DIRS | extra | self.detected_containers) - {""}
 
-        Unlike the original implementation this is anchored on the scan root
-        rather than a path component literally named ``Music``, so libraries in
-        arbitrary locations are parsed correctly.
+    def _path_directories(self, path: Path
+                          ) -> Tuple[Optional[List[str]], Optional[int]]:
+        """Meaningful directories between the scan root and *path*.
+
+        Returns ``(None, None)`` when the file is outside the scan root.
+        Container folders and ``CD1``-style disc folders are removed, so what
+        comes back is only the parts that could plausibly name an artist or an
+        album.
         """
         try:
             relative = path.relative_to(self.music_path)
         except ValueError:
-            return None, None, None
+            return None, None
 
         skip_names = self._skip_folder_names()
+        containers = self._configured_containers()
         disc: Optional[int] = None
         directories: List[str] = []
 
@@ -762,10 +815,78 @@ class AdvancedMusicOrganizer:
             if disc_number is not None:
                 disc = disc_number
                 continue
-            if naming.canonical_artist_key(part) in _GENERIC_DIRS:
+            if naming.canonical_artist_key(part) in containers:
                 continue
             directories.append(part)
 
+        return directories, disc
+
+    def detect_containers(self, records: Sequence[TrackRecord]) -> set:
+        """Work out which folders are containers rather than artists.
+
+        A folder two levels above a track is ambiguous: ``Nirvana/Nevermind/x``
+        and ``All Music/Nirvana/x`` have identical shapes, and the original
+        parser took the outer folder as the artist in both cases -- which is how
+        a folder called ``All Music`` ends up as an artist with every real
+        artist filed underneath it as an "album".
+
+        Rather than guess from a hardcoded list of names, this uses evidence
+        from the collection itself: a folder whose *children* are named after
+        artists the tags know about, while the folder itself is not, is a
+        container.
+
+        There is deliberately no structural fallback for a wholly untagged
+        library. ``Rips From Steve/Autechre/x.mp3`` and
+        ``Frank Zappa/Album 01/x.mp3`` are the same shape -- same depth, same
+        fan-out, files directly inside the child -- so any rule based on counts
+        alone will shatter a prolific artist into one "artist" per album, which
+        is worse than the problem it set out to fix. When there are no tags to
+        appeal to, name the folder in ``FOLDERS.container_folders`` instead.
+        """
+        tag_artists = {
+            naming.canonical_artist_key(record.tag_albumartist or record.tag_artist)
+            for record in records
+            if (record.tag_albumartist or record.tag_artist)
+        } - {""}
+
+        child_keys: Dict[str, set] = defaultdict(set)
+        display: Dict[str, str] = {}
+
+        for record in records:
+            directories, _ = self._path_directories(record.path)
+            if not directories or len(directories) < 2:
+                continue
+            outer, inner = directories[-2], directories[-1]
+            key = naming.canonical_artist_key(outer)
+            if not key:
+                continue
+            child_keys[key].add(naming.canonical_artist_key(inner))
+            display.setdefault(key, outer)
+
+        detected = set()
+        for key, children in child_keys.items():
+            if key in tag_artists:
+                continue  # the tags say this really is an artist
+
+            named_children = children & tag_artists
+            if named_children:
+                detected.add(key)
+                LOG.info("Treating '%s' as a container, not an artist: %d of its "
+                         "subfolders are artists the tags know about",
+                         display[key], len(named_children))
+
+        return detected
+
+    def parse_from_path(self, path: Path) -> Tuple[Optional[str], Optional[str], Optional[int]]:
+        """Infer ``(artist, album, disc)`` from directories below the scan root.
+
+        Unlike the original implementation this is anchored on the scan root
+        rather than a path component literally named ``Music``, so libraries in
+        arbitrary locations are parsed correctly.
+        """
+        directories, disc = self._path_directories(path)
+        if directories is None:
+            return None, None, None
         if not directories:
             return None, None, disc
 
@@ -1786,15 +1907,17 @@ class AdvancedMusicOrganizer:
     # Driver
     # ------------------------------------------------------------------
 
-    def organize(self, reindex: bool = False, fingerprint_lookup: bool = False) -> None:
+    def organize(self, reindex: bool = False, fingerprint_lookup: bool = False,
+                 assume_yes: bool = False) -> None:
         """Main organization function"""
         try:
-            self._organize(reindex, fingerprint_lookup)
+            self._organize(reindex, fingerprint_lookup, assume_yes)
         finally:
             # Release the SQLite handle; callers may delete the collection.
             self.close_database()
 
-    def _organize(self, reindex: bool = False, fingerprint_lookup: bool = False) -> None:
+    def _organize(self, reindex: bool = False, fingerprint_lookup: bool = False,
+                  assume_yes: bool = False) -> None:
         LOG.info("Advanced Music Organizer %s", __version__)
 
         if not MUTAGEN_AVAILABLE:
@@ -1802,6 +1925,9 @@ class AdvancedMusicOrganizer:
 
         if not self.music_path.exists():
             LOG.error("Source folder not found: %s", self.music_path)
+            return
+
+        if not self.check_not_duplicating_a_collection(assume_yes):
             return
 
         self.organized_path.mkdir(parents=True, exist_ok=True)
@@ -1830,6 +1956,11 @@ class AdvancedMusicOrganizer:
                  self.stats["already_in_library"])
 
         # Pass 3 - classify, which also populates the artist name registry.
+        # Container folders are worked out first, from the whole scan, because a
+        # single path cannot tell "Artist/Album" from "Container/Artist".
+        if self.config.getboolean("CLASSIFY", "detect_containers", fallback=True):
+            self.detected_containers = self.detect_containers(kept)
+
         LOG.info("Classifying...")
         for record in kept:
             self.classify(record)
@@ -2424,6 +2555,15 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     organizer = AdvancedMusicOrganizer(
         args.music_path, args.config, output_path=output, dry_run=args.dry_run
     )
+
+    # Check before touching the filesystem at all: attaching the log would
+    # otherwise create the very second collection we are refusing to build.
+    organizing = not (args.list_runs or args.undo is not None
+                      or args.apply_csv or args.resolve)
+    if organizing and not organizer.check_not_duplicating_a_collection(args.yes):
+        organizer.close_database()
+        return 2
+
     # Migrate before attaching the log: attaching creates the reports folder,
     # and a pre-existing destination is (correctly) treated as "do not clobber",
     # which would leave the collection with both the old and the new folder.
@@ -2458,7 +2598,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             organizer.config.set("PERFORMANCE", "workers", str(max(0, args.workers)))
 
         organizer.organize(reindex=args.reindex or args.incremental,
-                           fingerprint_lookup=args.fingerprint)
+                           fingerprint_lookup=args.fingerprint,
+                           assume_yes=args.yes)
         return 0
     finally:
         organizer.close_database()
